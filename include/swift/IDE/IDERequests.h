@@ -19,6 +19,7 @@
 #include "swift/AST/ASTTypeIDs.h"
 #include "swift/AST/Evaluator.h"
 #include "swift/AST/SimpleRequest.h"
+#include "swift/AST/SourceFile.h"
 #include "swift/IDE/Utils.h"
 #include "swift/IDE/IDETypeIDs.h"
 
@@ -37,8 +38,7 @@ struct CursorInfoOwner {
   CursorInfoOwner(SourceFile *File, SourceLoc Loc): File(File), Loc(Loc) { }
 
   friend llvm::hash_code hash_value(const CursorInfoOwner &CI) {
-    return hash_combine(hash_value(CI.File),
-      hash_value(CI.Loc.getOpaquePointerValue()));
+    return llvm::hash_combine(CI.File, CI.Loc.getOpaquePointerValue());
   }
 
   friend bool operator==(const CursorInfoOwner &lhs, const CursorInfoOwner &rhs) {
@@ -60,7 +60,7 @@ void simple_display(llvm::raw_ostream &out, const CursorInfoOwner &owner);
 class CursorInfoRequest:
     public SimpleRequest<CursorInfoRequest,
                          ide::ResolvedCursorInfo(CursorInfoOwner),
-                         CacheKind::Cached>
+                         RequestFlags::Cached>
 {
 public:
   using SimpleRequest::SimpleRequest;
@@ -69,8 +69,8 @@ private:
   friend SimpleRequest;
 
   // Evaluation.
-  llvm::Expected<ide::ResolvedCursorInfo> evaluate(Evaluator &evaluator,
-    CursorInfoOwner CI) const;
+  ide::ResolvedCursorInfo evaluate(Evaluator &evaluator,
+                                   CursorInfoOwner CI) const;
 
 public:
   // Caching
@@ -96,9 +96,9 @@ struct RangeInfoOwner {
   RangeInfoOwner(SourceFile *File, unsigned Offset, unsigned Length);
 
   friend llvm::hash_code hash_value(const RangeInfoOwner &CI) {
-    return hash_combine(hash_value(CI.File),
-                        hash_value(CI.StartLoc.getOpaquePointerValue()),
-                        hash_value(CI.EndLoc.getOpaquePointerValue()));
+    return llvm::hash_combine(CI.File,
+                              CI.StartLoc.getOpaquePointerValue(),
+                              CI.EndLoc.getOpaquePointerValue());
   }
 
   friend bool operator==(const RangeInfoOwner &lhs, const RangeInfoOwner &rhs) {
@@ -121,7 +121,7 @@ void simple_display(llvm::raw_ostream &out, const RangeInfoOwner &owner);
 class RangeInfoRequest:
     public SimpleRequest<RangeInfoRequest,
                          ide::ResolvedRangeInfo(RangeInfoOwner),
-                         CacheKind::Cached>
+                         RequestFlags::Cached>
 {
 public:
   using SimpleRequest::SimpleRequest;
@@ -130,8 +130,8 @@ private:
   friend SimpleRequest;
 
   // Evaluation.
-  llvm::Expected<ide::ResolvedRangeInfo> evaluate(Evaluator &evaluator,
-    RangeInfoOwner CI) const;
+  ide::ResolvedRangeInfo evaluate(Evaluator &evaluator,
+                                  RangeInfoOwner CI) const;
 
 public:
   // Caching
@@ -149,7 +149,7 @@ public:
 class ProvideDefaultImplForRequest:
     public SimpleRequest<ProvideDefaultImplForRequest,
                          ArrayRef<ValueDecl*>(ValueDecl*),
-                         CacheKind::Cached>
+                         RequestFlags::Cached>
 {
 public:
   using SimpleRequest::SimpleRequest;
@@ -158,8 +158,8 @@ private:
   friend SimpleRequest;
 
   // Evaluation.
-  llvm::Expected<ArrayRef<ValueDecl*>> evaluate(Evaluator &evaluator,
-    ValueDecl* VD) const;
+  ArrayRef<ValueDecl*> evaluate(Evaluator &evaluator,
+                                ValueDecl* VD) const;
 
 public:
   // Caching
@@ -182,9 +182,9 @@ struct OverridenDeclsOwner {
       Transitive(Transitive) {}
 
   friend llvm::hash_code hash_value(const OverridenDeclsOwner &CI) {
-    return hash_combine(hash_value(CI.VD),
-                        hash_value(CI.IncludeProtocolRequirements),
-                        hash_value(CI.Transitive));
+    return llvm::hash_combine(CI.VD,
+                              CI.IncludeProtocolRequirements,
+                              CI.Transitive);
   }
 
   friend bool operator==(const OverridenDeclsOwner &lhs,
@@ -211,7 +211,7 @@ struct OverridenDeclsOwner {
 class CollectOverriddenDeclsRequest:
     public SimpleRequest<CollectOverriddenDeclsRequest,
                          ArrayRef<ValueDecl*>(OverridenDeclsOwner),
-                         CacheKind::Cached> {
+                         RequestFlags::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
 
@@ -219,8 +219,8 @@ private:
   friend SimpleRequest;
 
   // Evaluation.
-  llvm::Expected<ArrayRef<ValueDecl*>> evaluate(Evaluator &evaluator,
-    OverridenDeclsOwner Owner) const;
+  ArrayRef<ValueDecl*> evaluate(Evaluator &evaluator,
+                                OverridenDeclsOwner Owner) const;
 
 public:
   // Caching
@@ -262,7 +262,7 @@ struct ProtocolNameOwner {
 class ResolveProtocolNameRequest:
     public SimpleRequest<ResolveProtocolNameRequest,
                          ProtocolDecl*(ProtocolNameOwner),
-                         CacheKind::Cached>
+                         RequestFlags::Cached>
 {
 public:
   using SimpleRequest::SimpleRequest;
@@ -271,8 +271,8 @@ private:
   friend SimpleRequest;
 
   // Evaluation.
-  llvm::Expected<ProtocolDecl*> evaluate(Evaluator &evaluator,
-    ProtocolNameOwner Input) const;
+  ProtocolDecl *evaluate(Evaluator &evaluator,
+                         ProtocolNameOwner Input) const;
 
 public:
   // Caching
@@ -282,22 +282,21 @@ public:
 };
 
 /// The zone number for the IDE.
-#define SWIFT_IDE_REQUESTS_TYPEID_ZONE 137
-#define SWIFT_TYPEID_ZONE SWIFT_IDE_REQUESTS_TYPEID_ZONE
+#define SWIFT_TYPEID_ZONE IDE
 #define SWIFT_TYPEID_HEADER "swift/IDE/IDERequestIDZone.def"
 #include "swift/Basic/DefineTypeIDZone.h"
 #undef SWIFT_TYPEID_ZONE
 #undef SWIFT_TYPEID_HEADER
 
 // Set up reporting of evaluated requests.
-#define SWIFT_TYPEID(RequestType)                                \
-template<>                                                       \
-inline void reportEvaluatedRequest(UnifiedStatsReporter &stats,  \
-                            const RequestType &request) {        \
-  ++stats.getFrontendCounters().RequestType;                     \
+#define SWIFT_REQUEST(Zone, RequestType, Sig, Caching, LocOptions)             \
+template<>                                                                     \
+inline void reportEvaluatedRequest(UnifiedStatsReporter &stats,                \
+                            const RequestType &request) {                      \
+  ++stats.getFrontendCounters().RequestType;                                   \
 }
 #include "swift/IDE/IDERequestIDZone.def"
-#undef SWIFT_TYPEID
+#undef SWIFT_REQUEST
 
 } // end namespace swift
 

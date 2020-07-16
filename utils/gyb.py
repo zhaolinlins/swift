@@ -7,13 +7,16 @@ from __future__ import print_function
 import os
 import re
 import sys
+import textwrap
+import tokenize
+from bisect import bisect
+
+
 try:
     from cStringIO import StringIO
 except ImportError:
     from io import StringIO
-import textwrap
-import tokenize
-from bisect import bisect
+
 
 try:
     basestring
@@ -760,8 +763,8 @@ def expand(filename, line_directive=_default_line_directive, **local_bindings):
     >>> # manually handle closing and deleting this file to allow us to open
     >>> # the file by its name across all platforms.
     >>> f = NamedTemporaryFile(delete=False)
-    >>> f.write(
-    ... r'''---
+    >>> _ = f.write(
+    ... br'''---
     ... % for i in range(int(x)):
     ... a pox on ${i} for epoxy
     ... % end
@@ -1133,16 +1136,6 @@ def execute_template(
 
 
 def main():
-    """
-    Lint this file.
-    >>> import sys
-    >>> gyb_path = os.path.realpath(__file__).replace('.pyc', '.py')
-    >>> sys.path.append(os.path.dirname(gyb_path))
-    >>> import python_lint
-    >>> python_lint.lint([gyb_path], verbose=False)
-    0
-    """
-
     import argparse
     import sys
 

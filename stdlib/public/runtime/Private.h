@@ -20,7 +20,6 @@
 #include "swift/Demangling/Demangler.h"
 #include "swift/Runtime/Config.h"
 #include "swift/Runtime/Metadata.h"
-#include "llvm/Support/Compiler.h"
 
 #if defined(__APPLE__) && defined(__MACH__)
 #include <TargetConditionals.h>
@@ -50,8 +49,10 @@ public:
 
 #define REF_STORAGE(Name, ...) \
   void set##Name() { Data |= Name; } \
-  bool is##Name() const { return Data & Name; }
+  bool is##Name() const { return Data == Name; }
 #include "swift/AST/ReferenceStorage.def"
+
+  bool isStrong() const { return Data == 0; }
 };
 
 /// Type information consists of metadata and its ownership info,
@@ -76,9 +77,11 @@ public:
   const Metadata *getMetadata() const { return Response.Value; }
   MetadataResponse getResponse() const { return Response; }
 
-  bool isWeak() const { return ReferenceOwnership.isWeak(); }
-  bool isUnowned() const { return ReferenceOwnership.isUnowned(); }
-  bool isUnmanaged() const { return ReferenceOwnership.isUnmanaged(); }
+#define REF_STORAGE(Name, ...) \
+  bool is##Name() const { return ReferenceOwnership.is##Name(); }
+#include "swift/AST/ReferenceStorage.def"
+
+  bool isStrong() const { return ReferenceOwnership.isStrong(); }
 
   TypeReferenceOwnership getReferenceOwnership() const {
     return ReferenceOwnership;
@@ -93,14 +96,23 @@ public:
 // out the proper includes from libobjc. The values MUST match the ones from
 // libobjc. Debug builds check these values against objc_debug_isa_class_mask
 // from libobjc.
-#  if TARGET_OS_SIMULATOR
-// Simulators don't currently use isa masking, but we still want to emit
+#  if TARGET_OS_SIMULATOR && __x86_64__
+// Simulators don't currently use isa masking on x86, but we still want to emit
 // swift_isaMask and the corresponding code in case that changes. libobjc's
 // mask has the bottom bits clear to include pointer alignment, match that
 // value here.
 #    define SWIFT_ISA_MASK 0xfffffffffffffff8ULL
 #  elif __arm64__
-#    define SWIFT_ISA_MASK 0x0000000ffffffff8ULL
+// ARM64 simulators always use the ARM64e mask.
+#    if __has_feature(ptrauth_calls) || TARGET_OS_SIMULATOR
+#      define SWIFT_ISA_MASK 0x007ffffffffffff8ULL
+#    else
+#      if TARGET_OS_OSX
+#      define SWIFT_ISA_MASK 0x00007ffffffffff8ULL
+#      else
+#      define SWIFT_ISA_MASK 0x0000000ffffffff8ULL
+#      endif
+#    endif
 #  elif __x86_64__
 #    define SWIFT_ISA_MASK 0x00007ffffffffff8ULL
 #  else
@@ -188,10 +200,10 @@ public:
   }
 #endif
 
-  LLVM_LIBRARY_VISIBILITY
+  SWIFT_LIBRARY_VISIBILITY
   const ClassMetadata *_swift_getClass(const void *object);
 
-  LLVM_LIBRARY_VISIBILITY
+  SWIFT_LIBRARY_VISIBILITY
   bool usesNativeSwiftReferenceCounting(const ClassMetadata *theClass);
 
   static inline
@@ -283,7 +295,7 @@ public:
     /// An element in the descriptor path.
     struct PathElement {
       /// The generic parameters local to this element.
-      ArrayRef<GenericParamDescriptor> localGenericParams;
+      llvm::ArrayRef<GenericParamDescriptor> localGenericParams;
 
       /// The total number of generic parameters.
       unsigned numTotalGenericParams;
@@ -384,10 +396,10 @@ public:
   /// Use with \c _getTypeByMangledName to decode potentially-generic types.
   class SWIFT_RUNTIME_LIBRARY_VISIBILITY SubstGenericParametersFromWrittenArgs {
     /// The complete set of generic arguments.
-    const SmallVectorImpl<const Metadata *> &allGenericArgs;
+    const llvm::SmallVectorImpl<const Metadata *> &allGenericArgs;
 
     /// The counts of generic parameters at each level.
-    const SmallVectorImpl<unsigned> &genericParamCounts;
+    const llvm::SmallVectorImpl<unsigned> &genericParamCounts;
 
   public:
     /// Initialize a new function object to handle substitutions. Both
@@ -401,10 +413,10 @@ public:
     /// \param genericParamCounts The count of generic parameters at each
     /// generic level, typically gathered by _gatherGenericParameterCounts.
     explicit SubstGenericParametersFromWrittenArgs(
-        const SmallVectorImpl<const Metadata *> &allGenericArgs,
-        const SmallVectorImpl<unsigned> &genericParamCounts)
-      : allGenericArgs(allGenericArgs), genericParamCounts(genericParamCounts) {
-    }
+        const llvm::SmallVectorImpl<const Metadata *> &allGenericArgs,
+        const llvm::SmallVectorImpl<unsigned> &genericParamCounts)
+        : allGenericArgs(allGenericArgs),
+          genericParamCounts(genericParamCounts) {}
 
     const Metadata *getMetadata(unsigned depth, unsigned index) const;
     const WitnessTable *getWitnessTable(const Metadata *type,

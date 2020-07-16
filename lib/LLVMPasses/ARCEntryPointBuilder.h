@@ -72,14 +72,18 @@ class ARCEntryPointBuilder {
   llvm::CallingConv::ID DefaultCC;
 
   llvm::CallInst *CreateCall(Constant *Fn, Value *V) {
-    CallInst *CI = B.CreateCall(Fn, V);
+    CallInst *CI = B.CreateCall(
+        cast<llvm::FunctionType>(Fn->getType()->getPointerElementType()), Fn,
+        V);
     if (auto Fun = llvm::dyn_cast<llvm::Function>(Fn))
       CI->setCallingConv(Fun->getCallingConv());
     return CI;
   }
 
   llvm::CallInst *CreateCall(Constant *Fn, llvm::ArrayRef<Value *> Args) {
-    CallInst *CI = B.CreateCall(Fn, Args);
+    CallInst *CI = B.CreateCall(
+        cast<llvm::FunctionType>(Fn->getType()->getPointerElementType()), Fn,
+        Args);
     if (auto Fun = llvm::dyn_cast<llvm::Function>(Fn))
       CI->setCallingConv(Fun->getCallingConv());
     return CI;
@@ -252,9 +256,10 @@ private:
     auto AttrList = AttributeList::get(M.getContext(), 1, Attribute::NoCapture);
     AttrList = AttrList.addAttribute(
         M.getContext(), AttributeList::FunctionIndex, Attribute::NoUnwind);
-    CheckUnowned = M.getOrInsertFunction("swift_checkUnowned", AttrList,
-                                         Type::getVoidTy(M.getContext()),
-                                         ObjectPtrTy);
+    CheckUnowned = cast<llvm::Function>(
+        M.getOrInsertFunction("swift_checkUnowned", AttrList,
+                              Type::getVoidTy(M.getContext()), ObjectPtrTy)
+            .getCallee());
     if (llvm::Triple(M.getTargetTriple()).isOSBinFormatCOFF() &&
         !llvm::Triple(M.getTargetTriple()).isOSCygMing())
       if (auto *F = llvm::dyn_cast<llvm::Function>(CheckUnowned.get()))

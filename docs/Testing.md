@@ -24,6 +24,24 @@ We use multiple approaches to test the Swift toolchain.
   locally before committing.  (Usually on a single platform, and not necessarily
   all tests.)
 * Buildbots run all tests, on all supported platforms.
+  [Smoke testing](ContinuousIntegration.md#smoke-testing)
+  skips the iOS, tvOS, and watchOS platforms.
+
+The [test/lit.cfg](https://github.com/apple/swift/blob/master/test/lit.cfg)
+uses an iOS 10.3 simulator configuration named "iPhone 5" for 32-bit testing.
+
+1.  Download and install the iOS 10.3 simulator runtime, in Xcode's
+    [Components](https://help.apple.com/xcode/#/deva7379ae35) preferences.
+
+2.  Create an "iPhone 5" simulator configuration, either in Xcode's
+    [Devices and Simulators](https://help.apple.com/xcode/#/devf225e58da)
+    window, or with the command line:
+
+    ```sh
+    xcrun simctl create 'iPhone 5' com.apple.CoreSimulator.SimDeviceType.iPhone-5 com.apple.CoreSimulator.SimRuntime.iOS-10-3
+    ```
+
+3.  Append `--ios` to the `utils/build-script` command line (see below).
 
 ### Testsuite subsets
 
@@ -48,6 +66,22 @@ test suite, via ``utils/build-script --validation-test``.
 
 Using ``utils/build-script`` will rebuild all targets which can add substantial
 time to a debug cycle.
+
+#### Using utils/run-test
+
+Using `utils/run-test` allows the user to run a single test or tests in a specific directory. 
+This can significantly speed up the debug cycle.  One can use this tool 
+instead of invoking `lit.py` directly as described in the next section.
+
+Here is an example of running the `test/Parse` tests:
+```
+    % ${swift_SOURCE_ROOT}/utils/run-test --build-dir ${SWIFT_BUILD_DIR} ${swift_SOURCE_ROOT}/test/Parse
+```
+Note that one example of a valid `${SWIFT_BUILD_DIR}` is 
+`{swift_SOURCE_ROOT}/../build/Ninja-DebugAssert/swift-linux-x86_64`.  
+It differs based on your build options and on which directory you invoke the script from.
+
+For full help options, pass `-h` to `utils/run-test` utility.
 
 #### Using lit.py
 
@@ -232,7 +266,7 @@ code for the target that is not the build machine:
 
 * ``%target-typecheck-verify-swift``: parse and type check the current Swift file
   for the target platform and verify diagnostics, like ``swift -frontend -typecheck -verify
-  %s``.
+  %s``. For further explanation of `-verify` mode, see [Diagnostics.md](Diagnostics.md).
 
   Use this substitution for testing semantic analysis in the compiler.
 
@@ -250,6 +284,34 @@ code for the target that is not the build machine:
 
   Use this substitution only when you intend to run the program later in the
   test.
+
+* ``%target-run-simple-swift``: build a one-file Swift program and run it on
+  the target machine.
+
+  Use this substitution for executable tests that don't require special
+  compiler arguments.
+
+  Add ``REQUIRES: executable_test`` to the test.
+
+* ``%target-run-simple-swift(`` *compiler arguments* ``)``: like
+  ``%target-run-simple-swift``, but enables specifying compiler arguments when
+  compiling the Swift program.
+
+  Add ``REQUIRES: executable_test`` to the test.
+
+* ``%target-run-simple-swiftgyb``: build a one-file Swift `.gyb` program and
+  run it on the target machine.
+
+  Use this substitution for executable tests that don't require special
+  compiler arguments.
+
+  Add ``REQUIRES: executable_test`` to the test.
+
+* ``%target-run-simple-swiftgyb(`` *compiler arguments* ``)``: like
+  ``%target-run-simple-swiftgyb``, but enables specifying compiler arguments
+  when compiling the Swift program.
+
+  Add ``REQUIRES: executable_test`` to the test.
 
 * ``%target-run-simple-swift``: build a one-file Swift program and run it on
   the target machine.

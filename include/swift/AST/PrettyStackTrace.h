@@ -20,8 +20,13 @@
 
 #include "llvm/Support/PrettyStackTrace.h"
 #include "swift/Basic/SourceLoc.h"
+#include "swift/AST/AnyFunctionRef.h"
 #include "swift/AST/Identifier.h"
 #include "swift/AST/Type.h"
+
+namespace clang {
+  class Type;
+}
 
 namespace swift {
   class ASTContext;
@@ -33,22 +38,24 @@ namespace swift {
   class TypeRepr;
 
 void printSourceLocDescription(llvm::raw_ostream &out, SourceLoc loc,
-                               ASTContext &Context, bool addNewline = true);
+                               const ASTContext &Context,
+                               bool addNewline = true);
 
 /// PrettyStackTraceLocation - Observe that we are doing some
 /// processing starting at a fixed location.
 class PrettyStackTraceLocation : public llvm::PrettyStackTraceEntry {
-  ASTContext &Context;
+  const ASTContext &Context;
   SourceLoc Loc;
   const char *Action;
 public:
-  PrettyStackTraceLocation(ASTContext &C, const char *action, SourceLoc loc)
+  PrettyStackTraceLocation(const ASTContext &C, const char *action,
+                           SourceLoc loc)
     : Context(C), Loc(loc), Action(action) {}
   virtual void print(llvm::raw_ostream &OS) const;
 };
 
 void printDeclDescription(llvm::raw_ostream &out, const Decl *D,
-                          ASTContext &Context, bool addNewline = true);
+                          const ASTContext &Context, bool addNewline = true);
 
 /// PrettyStackTraceDecl - Observe that we are processing a specific
 /// declaration.
@@ -61,72 +68,95 @@ public:
   virtual void print(llvm::raw_ostream &OS) const;
 };
 
+/// PrettyStackTraceAnyFunctionRef - Observe that we are processing a specific
+/// function or closure literal.
+class PrettyStackTraceAnyFunctionRef : public llvm::PrettyStackTraceEntry {
+  AnyFunctionRef TheRef;
+  const char *Action;
+public:
+  PrettyStackTraceAnyFunctionRef(const char *action, AnyFunctionRef ref)
+    : TheRef(ref), Action(action) {}
+  virtual void print(llvm::raw_ostream &OS) const;
+};
+
 void printExprDescription(llvm::raw_ostream &out, Expr *E,
-                          ASTContext &Context, bool addNewline = true);
+                          const ASTContext &Context, bool addNewline = true);
 
 /// PrettyStackTraceExpr - Observe that we are processing a specific
 /// expression.
 class PrettyStackTraceExpr : public llvm::PrettyStackTraceEntry {
-  ASTContext &Context;
+  const ASTContext &Context;
   Expr *TheExpr;
   const char *Action;
 public:
-  PrettyStackTraceExpr(ASTContext &C, const char *action, Expr *E)
+  PrettyStackTraceExpr(const ASTContext &C, const char *action, Expr *E)
     : Context(C), TheExpr(E), Action(action) {}
   virtual void print(llvm::raw_ostream &OS) const;
 };
 
 void printStmtDescription(llvm::raw_ostream &out, Stmt *S,
-                          ASTContext &Context, bool addNewline = true);
+                          const ASTContext &Context, bool addNewline = true);
 
 /// PrettyStackTraceStmt - Observe that we are processing a specific
 /// statement.
 class PrettyStackTraceStmt : public llvm::PrettyStackTraceEntry {
-  ASTContext &Context;
+  const ASTContext &Context;
   Stmt *TheStmt;
   const char *Action;
 public:
-  PrettyStackTraceStmt(ASTContext &C, const char *action, Stmt *S)
+  PrettyStackTraceStmt(const ASTContext &C, const char *action, Stmt *S)
     : Context(C), TheStmt(S), Action(action) {}
   virtual void print(llvm::raw_ostream &OS) const;
 };
 
 void printPatternDescription(llvm::raw_ostream &out, Pattern *P,
-                             ASTContext &Context, bool addNewline = true);
+                             const ASTContext &Context, bool addNewline = true);
 
 /// PrettyStackTracePattern - Observe that we are processing a
 /// specific pattern.
 class PrettyStackTracePattern : public llvm::PrettyStackTraceEntry {
-  ASTContext &Context;
+  const ASTContext &Context;
   Pattern *ThePattern;
   const char *Action;
 public:
-  PrettyStackTracePattern(ASTContext &C, const char *action, Pattern *P)
+  PrettyStackTracePattern(const ASTContext &C, const char *action, Pattern *P)
     : Context(C), ThePattern(P), Action(action) {}
   virtual void print(llvm::raw_ostream &OS) const;
 };
 
 void printTypeDescription(llvm::raw_ostream &out, Type T,
-                          ASTContext &Context, bool addNewline = true);
+                          const ASTContext &Context, bool addNewline = true);
 
 /// PrettyStackTraceType - Observe that we are processing a specific type.
 class PrettyStackTraceType : public llvm::PrettyStackTraceEntry {
-  ASTContext &Context;
+  const ASTContext &Context;
   Type TheType;
   const char *Action;
 public:
-  PrettyStackTraceType(ASTContext &C, const char *action, Type type)
+  PrettyStackTraceType(const ASTContext &C, const char *action, Type type)
     : Context(C), TheType(type), Action(action) {}
+  virtual void print(llvm::raw_ostream &OS) const;
+};
+
+/// PrettyStackTraceClangType - Observe that we are processing a
+/// specific Clang type.
+class PrettyStackTraceClangType : public llvm::PrettyStackTraceEntry {
+  const clang::Type *TheType;
+  const char *Action;
+public:
+  PrettyStackTraceClangType(const char *action, const clang::Type *type)
+    : TheType(type), Action(action) {}
   virtual void print(llvm::raw_ostream &OS) const;
 };
 
 /// Observe that we are processing a specific type representation.
 class PrettyStackTraceTypeRepr : public llvm::PrettyStackTraceEntry {
-  ASTContext &Context;
+  const ASTContext &Context;
   TypeRepr *TheType;
   const char *Action;
 public:
-  PrettyStackTraceTypeRepr(ASTContext &C, const char *action, TypeRepr *type)
+  PrettyStackTraceTypeRepr(const ASTContext &C, const char *action,
+                           TypeRepr *type)
     : Context(C), TheType(type), Action(action) {}
   virtual void print(llvm::raw_ostream &OS) const;
 };
@@ -134,11 +164,11 @@ public:
 /// PrettyStackTraceConformance - Observe that we are processing a
 /// specific protocol conformance.
 class PrettyStackTraceConformance : public llvm::PrettyStackTraceEntry {
-  ASTContext &Context;
+  const ASTContext &Context;
   const ProtocolConformance *Conformance;
   const char *Action;
 public:
-  PrettyStackTraceConformance(ASTContext &C, const char *action,
+  PrettyStackTraceConformance(const ASTContext &C, const char *action,
                               const ProtocolConformance *conformance)
     : Context(C), Conformance(conformance), Action(action) {}
   virtual void print(llvm::raw_ostream &OS) const;
@@ -146,16 +176,17 @@ public:
 
 void printConformanceDescription(llvm::raw_ostream &out,
                                  const ProtocolConformance *conformance,
-                                 ASTContext &Context, bool addNewline = true);
+                                 const ASTContext &Context,
+                                 bool addNewline = true);
 
 class PrettyStackTraceGenericSignature : public llvm::PrettyStackTraceEntry {
   const char *Action;
-  GenericSignature *GenericSig;
+  GenericSignature GenericSig;
   Optional<unsigned> Requirement;
 
 public:
   PrettyStackTraceGenericSignature(const char *action,
-                                   GenericSignature *genericSig,
+                                   GenericSignature genericSig,
                                    Optional<unsigned> requirement = None)
     : Action(action), GenericSig(genericSig), Requirement(requirement) { }
 
@@ -173,6 +204,35 @@ public:
   PrettyStackTraceSelector(const char *action, ObjCSelector S)
     : Selector(S), Action(action) {}
   void print(llvm::raw_ostream &OS) const override;
+};
+
+/// PrettyStackTraceDifferentiabilityWitness - Observe that we are processing a
+/// specific differentiability witness.
+class PrettyStackTraceDifferentiabilityWitness
+    : public llvm::PrettyStackTraceEntry {
+  const SILDifferentiabilityWitnessKey Key;
+  const char *Action;
+
+public:
+  PrettyStackTraceDifferentiabilityWitness(
+      const char *action, const SILDifferentiabilityWitnessKey key)
+      : Key(key), Action(action) {}
+  virtual void print(llvm::raw_ostream &OS) const;
+};
+
+void printDifferentiabilityWitnessDescription(
+    llvm::raw_ostream &out, const SILDifferentiabilityWitnessKey key,
+    bool addNewline = true);
+
+/// PrettyStackTraceDeclContext - Observe that we are processing a
+/// specific decl context.
+class PrettyStackTraceDeclContext : public llvm::PrettyStackTraceEntry {
+  const DeclContext *DC;
+  const char *Action;
+public:
+  PrettyStackTraceDeclContext(const char *action, const DeclContext *DC)
+    : DC(DC), Action(action) {}
+  virtual void print(llvm::raw_ostream &OS) const;
 };
 
 } // end namespace swift

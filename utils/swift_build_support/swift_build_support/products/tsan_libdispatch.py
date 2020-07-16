@@ -12,7 +12,17 @@
 
 import os
 
+from . import cmark
+from . import foundation
+from . import libcxx
+from . import libdispatch
+from . import libicu
+from . import llbuild
+from . import llvm
 from . import product
+from . import swift
+from . import swiftpm
+from . import xctest
 from .. import shell
 
 
@@ -28,6 +38,9 @@ class TSanLibDispatch(product.Product):
     @classmethod
     def is_build_script_impl_product(cls):
         return False
+
+    def should_build(self, host_target):
+        return True
 
     def build(self, host_target):
         """Build TSan runtime (compiler-rt)."""
@@ -59,6 +72,9 @@ class TSanLibDispatch(product.Product):
             shell.call(config_cmd)
             shell.call(build_cmd)
 
+    def should_test(self, host_target):
+        return True
+
     def test(self, host_target):
         """Run check-tsan target with a LIT filter for libdispatch."""
         cmd = ['ninja', 'check-tsan']
@@ -66,3 +82,22 @@ class TSanLibDispatch(product.Product):
 
         with shell.pushd(self.build_dir):
             shell.call(cmd, env=env)
+
+    def should_install(self, host_target):
+        return False
+
+    def install(self, host_target):
+        pass
+
+    @classmethod
+    def get_dependencies(cls):
+        return [cmark.CMark,
+                llvm.LLVM,
+                libcxx.LibCXX,
+                libicu.LibICU,
+                swift.Swift,
+                libdispatch.LibDispatch,
+                foundation.Foundation,
+                xctest.XCTest,
+                llbuild.LLBuild,
+                swiftpm.SwiftPM]

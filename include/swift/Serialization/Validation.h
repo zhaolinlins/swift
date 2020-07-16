@@ -77,6 +77,7 @@ struct ValidationInfo {
   StringRef name = {};
   StringRef targetTriple = {};
   StringRef shortVersion = {};
+  StringRef miscVersion = {};
   version::Version compatibilityVersion = {};
   size_t bytes = 0;
   Status status = Status::Malformed;
@@ -92,12 +93,12 @@ struct ValidationInfo {
 class ExtendedValidationInfo {
   SmallVector<StringRef, 4> ExtraClangImporterOpts;
   StringRef SDKPath;
-  StringRef ParseableInterface;
   struct {
     unsigned ArePrivateImportsEnabled : 1;
     unsigned IsSIB : 1;
     unsigned IsTestable : 1;
     unsigned ResilienceStrategy : 2;
+    unsigned IsImplicitDynamicEnabled: 1;
   } Bits;
 public:
   ExtendedValidationInfo() : Bits() {}
@@ -114,8 +115,6 @@ public:
   void addExtraClangImporterOption(StringRef option) {
     ExtraClangImporterOpts.push_back(option);
   }
-  StringRef getParseableInterface() const { return ParseableInterface; }
-  void setParseableInterface(StringRef PI) { ParseableInterface = PI; }
 
   bool isSIB() const { return Bits.IsSIB; }
   void setIsSIB(bool val) {
@@ -124,6 +123,10 @@ public:
   bool arePrivateImportsEnabled() { return Bits.ArePrivateImportsEnabled; }
   void setPrivateImportsEnabled(bool enabled) {
     Bits.ArePrivateImportsEnabled = enabled;
+  }
+  bool isImplicitDynamicEnabled() { return Bits.IsImplicitDynamicEnabled; }
+  void setImplicitDynamicEnabled(bool val) {
+    Bits.IsImplicitDynamicEnabled = val;
   }
   bool isTestable() const { return Bits.IsTestable; }
   void setIsTestable(bool val) {

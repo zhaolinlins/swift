@@ -66,11 +66,19 @@ extern int autolink_extract_main(ArrayRef<const char *> Args, const char *Argv0,
 extern int modulewrap_main(ArrayRef<const char *> Args, const char *Argv0,
                            void *MainAddr);
 
-/// Run 'swift-format'
-extern int swift_format_main(ArrayRef<const char *> Args, const char *Argv0,
+/// Run 'swift-indent'
+extern int swift_indent_main(ArrayRef<const char *> Args, const char *Argv0,
                              void *MainAddr);
 
-/// Determine if the given invocation should run as a subcommand.
+/// Run 'swift-symbolgraph-extract'
+extern int swift_symbolgraph_extract_main(ArrayRef<const char *> Args, const char *Argv0,
+void *MainAddr);
+
+/// Determine if the given invocation should run as a "subcommand".
+///
+/// Examples of "subcommands" are 'swift build' or 'swift test', which are
+/// usually used to invoke the Swift package manager executables 'swift-build'
+/// and 'swift-test', respectively.
 ///
 /// \param ExecName The name of the argv[0] we were invoked as.
 /// \param SubcommandName On success, the full name of the subcommand to invoke.
@@ -134,6 +142,14 @@ static int run_driver(StringRef ExecName,
     }
   }
 
+  // Run the integrated Swift frontend when called as "swift-frontend" but
+  // without a leading "-frontend".
+  if (ExecName == "swift-frontend") {
+    return performFrontend(llvm::makeArrayRef(argv.data()+1,
+                                              argv.data()+argv.size()),
+                           argv[0], (void *)(intptr_t)getExecutablePath);
+  }
+
   std::string Path = getExecutablePath(argv[0]);
 
   PrintingDiagnosticConsumer PDC;
@@ -148,10 +164,12 @@ static int run_driver(StringRef ExecName,
     return autolink_extract_main(
       TheDriver.getArgsWithoutProgramNameAndDriverMode(argv),
       argv[0], (void *)(intptr_t)getExecutablePath);
-  case Driver::DriverKind::SwiftFormat:
-    return swift_format_main(
+  case Driver::DriverKind::SwiftIndent:
+    return swift_indent_main(
       TheDriver.getArgsWithoutProgramNameAndDriverMode(argv),
       argv[0], (void *)(intptr_t)getExecutablePath);
+  case Driver::DriverKind::SymbolGraph:
+      return swift_symbolgraph_extract_main(TheDriver.getArgsWithoutProgramNameAndDriverMode(argv), argv[0], (void *)(intptr_t)getExecutablePath);
   default:
     break;
   }

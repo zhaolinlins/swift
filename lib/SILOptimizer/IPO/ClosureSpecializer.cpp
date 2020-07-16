@@ -63,18 +63,19 @@
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILModule.h"
 #include "swift/SILOptimizer/Analysis/BasicCalleeAnalysis.h"
-#include "swift/SILOptimizer/Analysis/CFG.h"
 #include "swift/SILOptimizer/Analysis/FunctionOrder.h"
 #include "swift/SILOptimizer/Analysis/ValueTracking.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
-#include "swift/SILOptimizer/Utils/Local.h"
+#include "swift/SILOptimizer/Utils/CFGOptUtils.h"
+#include "swift/SILOptimizer/Utils/InstOptUtils.h"
 #include "swift/SILOptimizer/Utils/SILInliner.h"
 #include "swift/SILOptimizer/Utils/SILOptFunctionBuilder.h"
 #include "swift/SILOptimizer/Utils/SpecializationMangler.h"
 #include "swift/SILOptimizer/Utils/StackNesting.h"
-#include "llvm/ADT/SmallString.h"
+#include "swift/SILOptimizer/Utils/ValueLifetime.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
@@ -283,7 +284,7 @@ public:
 
   bool isTrivialNoEscapeParameter() const {
     auto ClosureParmFnTy =
-        getClosureParameterInfo().getType()->getAs<SILFunctionType>();
+        getClosureParameterInfo().getInterfaceType()->getAs<SILFunctionType>();
     return ClosureParmFnTy->isTrivialNoEscape();
   }
 
@@ -339,7 +340,7 @@ static void rewriteApplyInst(const CallSiteDescriptor &CSDesc,
   for (auto Arg : AI.getArguments()) {
     if (Index != CSDesc.getClosureIndex())
       NewArgs.push_back(Arg);
-    Index++;
+    ++Index;
   }
 
   // ... and appending the captured arguments. We also insert retains here at
@@ -648,12 +649,16 @@ ClosureSpecCloner::initCloned(SILOptFunctionBuilder &FunctionBuilder,
              || ParamConv == ParameterConvention::Indirect_Inout
              || ParamConv == ParameterConvention::Indirect_InoutAliasable);
     } else {
-      ParamConv = ClosedOverFunConv.getSILType(PInfo).isTrivial(*ClosureUser)
+      ParamConv = ClosedOverFunConv
+                          .getSILType(PInfo, CallSiteDesc.getApplyInst()
+                                                 .getFunction()
+                                                 ->getTypeExpansionContext())
+                          .isTrivial(*ClosureUser)
                       ? ParameterConvention::Direct_Unowned
                       : ParameterConvention::Direct_Owned;
     }
 
-    SILParameterInfo NewPInfo(PInfo.getType(), ParamConv);
+    SILParameterInfo NewPInfo(PInfo.getInterfaceType(), ParamConv);
     NewParameterInfoList.push_back(NewPInfo);
   }
 
@@ -664,11 +669,14 @@ ClosureSpecCloner::initCloned(SILOptFunctionBuilder &FunctionBuilder,
   ExtInfo = ExtInfo.withRepresentation(SILFunctionTypeRepresentation::Thin);
 
   auto ClonedTy = SILFunctionType::get(
-      ClosureUserFunTy->getGenericSignature(), ExtInfo,
+      ClosureUserFunTy->getInvocationGenericSignature(), ExtInfo,
       ClosureUserFunTy->getCoroutineKind(),
       ClosureUserFunTy->getCalleeConvention(), NewParameterInfoList,
       ClosureUserFunTy->getYields(), ClosureUserFunTy->getResults(),
-      ClosureUserFunTy->getOptionalErrorResult(), M.getASTContext());
+      ClosureUserFunTy->getOptionalErrorResult(),
+      ClosureUserFunTy->getPatternSubstitutions(),
+      ClosureUserFunTy->getInvocationSubstitutions(),
+      M.getASTContext());
 
   // We make this function bare so we don't have to worry about decls in the
   // SILArgument.
@@ -776,7 +784,7 @@ SILValue ClosureSpecCloner::cloneCalleeConversion(
 /// Populate the body of the cloned closure, modifying instructions as
 /// necessary. This is where we create the actual specialized BB Arguments
 void ClosureSpecCloner::populateCloned() {
-  bool needToUpdateStackNesting = false;
+  bool invalidatedStackNesting = false;
   SILFunction *Cloned = getCloned();
   SILFunction *ClosureUser = CallSiteDesc.getApplyCallee();
 
@@ -788,18 +796,17 @@ void ClosureSpecCloner::populateCloned() {
   entryArgs.reserve(ClosureUserEntryBB->getArguments().size());
 
   // Remove the closure argument.
-  SILArgument *ClosureArg = nullptr;
   for (size_t i = 0, e = ClosureUserEntryBB->args_size(); i != e; ++i) {
     SILArgument *Arg = ClosureUserEntryBB->getArgument(i);
     if (i == CallSiteDesc.getClosureIndex()) {
-      ClosureArg = Arg;
       entryArgs.push_back(SILValue());
       continue;
     }
 
     // Otherwise, create a new argument which copies the original argument
+    auto typeInContext = Cloned->getLoweredType(Arg->getType());
     SILValue MappedValue =
-        ClonedEntryBB->createFunctionArgument(Arg->getType(), Arg->getDecl());
+        ClonedEntryBB->createFunctionArgument(typeInContext, Arg->getDecl());
     entryArgs.push_back(MappedValue);
   }
 
@@ -811,6 +818,7 @@ void ClosureSpecCloner::populateCloned() {
   // such arguments. After this pass is done the only thing that will reference
   // the arguments is the partial apply that we will create.
   SILFunction *ClosedOverFun = CallSiteDesc.getClosureCallee();
+  SILBuilder &Builder = getBuilder();
   auto ClosedOverFunConv = ClosedOverFun->getConventions();
   unsigned NumTotalParams = ClosedOverFunConv.getNumParameters();
   unsigned NumNotCaptured = NumTotalParams - CallSiteDesc.getNumArguments();
@@ -818,7 +826,10 @@ void ClosureSpecCloner::populateCloned() {
   llvm::DenseMap<SILValue, SILValue> CapturedMap;
   unsigned idx = 0;
   for (auto &PInfo : ClosedOverFunConv.getParameters().slice(NumNotCaptured)) {
-    auto paramTy = ClosedOverFunConv.getSILType(PInfo);
+    auto paramTy =
+        ClosedOverFunConv.getSILType(PInfo, Builder.getTypeExpansionContext());
+    // Get the type in context of the new function.
+    paramTy = Cloned->getLoweredType(paramTy);
     SILValue MappedValue = ClonedEntryBB->createFunctionArgument(paramTy);
     NewPAIArgs.push_back(MappedValue);
     auto CapturedVal =
@@ -826,7 +837,6 @@ void ClosureSpecCloner::populateCloned() {
     CapturedMap[CapturedVal] = MappedValue;
   }
 
-  SILBuilder &Builder = getBuilder();
   Builder.setInsertionPoint(ClonedEntryBB);
 
   // Clone FRI and PAI, and replace usage of the removed closure argument
@@ -875,11 +885,11 @@ void ClosureSpecCloner::populateCloned() {
           Builder.createReleaseValue(Loc, SILValue(NewClosure),
                                      Builder.getDefaultAtomicity());
         else
-          needToUpdateStackNesting |=
+          invalidatedStackNesting |=
               CallSiteDesc.destroyIfPartialApplyStack(Builder, NewClosure);
         for (auto PAI : NeedsRelease) {
           if (PAI->isOnStack())
-            needToUpdateStackNesting |=
+            invalidatedStackNesting |=
                 CallSiteDesc.destroyIfPartialApplyStack(Builder, PAI);
           else
             Builder.createReleaseValue(Loc, SILValue(PAI),
@@ -904,11 +914,11 @@ void ClosureSpecCloner::populateCloned() {
         Builder.createReleaseValue(Loc, SILValue(NewClosure),
                                    Builder.getDefaultAtomicity());
       else
-        needToUpdateStackNesting |=
+        invalidatedStackNesting |=
             CallSiteDesc.destroyIfPartialApplyStack(Builder, NewClosure);
       for (auto PAI : NeedsRelease) {
         if (PAI->isOnStack())
-          needToUpdateStackNesting |=
+          invalidatedStackNesting |=
               CallSiteDesc.destroyIfPartialApplyStack(Builder, PAI);
         else
           Builder.createReleaseValue(Loc, SILValue(PAI),
@@ -916,7 +926,7 @@ void ClosureSpecCloner::populateCloned() {
       }
     }
   }
-  if (needToUpdateStackNesting) {
+  if (invalidatedStackNesting) {
     StackNesting().correctStackNesting(Cloned);
   }
 }
@@ -966,16 +976,23 @@ void SILClosureSpecializerTransform::run() {
     // specialized all of their uses.
     LLVM_DEBUG(llvm::dbgs() << "Trying to remove dead closures!\n");
     sortUnique(PropagatedClosures);
+    bool invalidatedStackNesting = false;
+
     for (auto *Closure : PropagatedClosures) {
       LLVM_DEBUG(llvm::dbgs() << "    Visiting: " << *Closure);
       if (!tryDeleteDeadClosure(Closure)) {
         LLVM_DEBUG(llvm::dbgs() << "        Failed to delete closure!\n");
-        NumPropagatedClosuresNotEliminated++;
+        ++NumPropagatedClosuresNotEliminated;
         continue;
       }
 
       LLVM_DEBUG(llvm::dbgs() << "        Deleted closure!\n");
       ++NumPropagatedClosuresEliminated;
+      invalidatedStackNesting = true;
+    }
+
+    if (invalidatedStackNesting) {
+      StackNesting().correctStackNesting(F);
     }
   }
 
@@ -1214,7 +1231,7 @@ bool SILClosureSpecializerTransform::gatherCallSites(
 
         // We currently only support copying intermediate reabastraction
         // closures if the closure is ultimately passed trivially.
-        bool IsClosurePassedTrivially = ClosureParamInfo.getType()
+        bool IsClosurePassedTrivially = ClosureParamInfo.getInterfaceType()
                                             ->castTo<SILFunctionType>()
                                             ->isTrivialNoEscape();
         if (HaveUsedReabstraction &&  !IsClosurePassedTrivially)

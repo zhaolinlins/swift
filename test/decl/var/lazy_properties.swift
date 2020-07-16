@@ -29,7 +29,7 @@ class TestClass {
 
   lazy var d : Int  // expected-error {{lazy properties must have an initializer}} {{3-8=}}
 
-  lazy var (e, f) = (1,2)  // expected-error {{'lazy' cannot destructure an initializer}} {{3-8=}}
+  lazy var (e, f) = (1,2)  // expected-error 2{{'lazy' cannot destructure an initializer}} {{3-8=}}
 
   lazy var g = { 0 }()   // single-expr closure
 
@@ -41,9 +41,17 @@ class TestClass {
 
   lazy var k : Int = { () -> Int in return 0 }()+1  // multi-stmt closure
 
-  lazy var l : Int = 42 {  // expected-error {{lazy properties must not have observers}} {{3-8=}}
-    didSet {
-    }
+  lazy var l : Int = 42 {  // Okay
+    didSet {}
+    willSet {}
+  }
+
+  lazy var m : Int = 42 { // Okay
+    didSet {}
+  }
+
+  lazy var n : Int = 42 {
+    willSet {} // Okay
   }
 
   init() {
@@ -112,7 +120,7 @@ struct Outer {
 
     lazy var y = {_ = 3}()
     // expected-warning@-1 {{variable 'y' inferred to have type '()', which may be unexpected}}
-    // expected-note@-2 {{add an explicit type annotation to silence this warning}}
+    // expected-note@-2 {{add an explicit type annotation to silence this warning}} {{15-15=: ()}}
   }
 }
 

@@ -21,6 +21,7 @@
 #include "swift/AST/ASTPrinter.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/NameLookup.h"
+#include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/SwiftNameTranslation.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/Basic/SourceManager.h"
@@ -57,11 +58,13 @@ public:
     :XMLEscapingPrinter(OS) { }
 
 private:
-  void printTypeRef(Type T, const TypeDecl *TD, Identifier Name) override {
+  void printTypeRef(
+      Type T, const TypeDecl *TD, Identifier Name,
+      PrintNameContext NameContext = PrintNameContext::Normal) override {
     printXML("<Type usr=\"");
     SwiftLangSupport::printUSR(TD, OS);
     printXML("\">");
-    StreamPrinter::printTypeRef(T, TD, Name);
+    StreamPrinter::printTypeRef(T, TD, Name, NameContext);
     printXML("</Type>");
   }
 };
@@ -272,11 +275,13 @@ private:
       closeTag(tag);
   }
 
-  void printTypeRef(Type T, const TypeDecl *TD, Identifier name) override {
+  void printTypeRef(
+      Type T, const TypeDecl *TD, Identifier name,
+      PrintNameContext NameContext = PrintNameContext::Normal) override {
     auto tag = getTagForDecl(TD, /*isRef=*/true);
     openTagWithUSRForDecl(tag, TD);
     insideRef = true;
-    XMLEscapingPrinter::printTypeRef(T, TD, name);
+    XMLEscapingPrinter::printTypeRef(T, TD, name, NameContext);
     insideRef = false;
     closeTag(tag);
   }
@@ -410,14 +415,13 @@ static void printAnnotatedDeclaration(const ValueDecl *VD,
   while (VD->isImplicit() && VD->getOverriddenDecl())
     VD = VD->getOverriddenDecl();
 
-  // If this is a property wrapper backing property (_foo) or projected value
-  // ($foo) and the wrapped property is not implicit, still print it.
-  if (auto *VarD = dyn_cast<VarDecl>(VD)) {
-    if (auto *Wrapped = VarD->getOriginalWrappedProperty()) {
-      if (!Wrapped->isImplicit())
-        PO.TreatAsExplicitDeclList.push_back(VD);
-    }
-  }
+  // VD may be a compiler synthesized member, constructor, or shorthand argument
+  // so always print it even if it's implicit.
+  //
+  // FIXME: Update PrintOptions::printQuickHelpDeclaration to print implicit
+  // decls by default. That causes issues due to newlines being printed before
+  // implicit OpaqueTypeDecls at time of writing.
+  PO.TreatAsExplicitDeclList.push_back(VD);
 
   // Wrap this up in XML, as that's what we'll use for documentation comments.
   OS<<"<Declaration>";
@@ -441,49 +445,47 @@ void SwiftLangSupport::printFullyAnnotatedDeclaration(const ValueDecl *VD,
   while (VD->isImplicit() && VD->getOverriddenDecl())
     VD = VD->getOverriddenDecl();
 
-  // If this is a property wrapper backing property (_foo) or projected value
-  // ($foo) and the wrapped property is not implicit, still print it.
-  if (auto *VarD = dyn_cast<VarDecl>(VD)) {
-    if (auto *Wrapped = VarD->getOriginalWrappedProperty()) {
-      if (!Wrapped->isImplicit())
-        PO.TreatAsExplicitDeclList.push_back(VD);
-    }
-  }
+  // VD may be a compiler synthesized member, constructor, or shorthand argument
+  // so always print it even if it's implicit.
+  //
+  // FIXME: Update PrintOptions::printQuickHelpDeclaration to print implicit
+  // decls by default. That causes issues due to newlines being printed before
+  // implicit OpaqueTypeDecls at time of writing.
+  PO.TreatAsExplicitDeclList.push_back(VD);
+
   VD->print(Printer, PO);
 }
 
-void SwiftLangSupport::printFullyAnnotatedGenericReq(
-    const swift::GenericSignature *Sig, llvm::raw_ostream &OS) {
-  assert(Sig);
+void SwiftLangSupport::printFullyAnnotatedDeclaration(const ExtensionDecl *ED,
+                                                      raw_ostream &OS) {
   FullyAnnotatedDeclarationPrinter Printer(OS);
   PrintOptions PO = PrintOptions::printQuickHelpDeclaration();
-  Sig->print(Printer, PO);
+  ED->print(Printer, PO);
 }
 
 void SwiftLangSupport::printFullyAnnotatedSynthesizedDeclaration(
     const swift::ValueDecl *VD, TypeOrExtensionDecl Target,
     llvm::raw_ostream &OS) {
-  // FIXME: Mutable global variable - gross!
-  static llvm::SmallDenseMap<swift::ValueDecl*,
-    std::unique_ptr<swift::SynthesizedExtensionAnalyzer>> TargetToAnalyzerMap;
   FullyAnnotatedDeclarationPrinter Printer(OS);
   PrintOptions PO = PrintOptions::printQuickHelpDeclaration();
-  NominalTypeDecl *TargetNTD = Target.getBaseNominal();
-
-  if (TargetToAnalyzerMap.count(TargetNTD) == 0) {
-    std::unique_ptr<SynthesizedExtensionAnalyzer> Analyzer(
-        new SynthesizedExtensionAnalyzer(TargetNTD, PO));
-    TargetToAnalyzerMap.insert({TargetNTD, std::move(Analyzer)});
-  }
   PO.initForSynthesizedExtension(Target);
   PO.PrintAsMember = true;
   VD->print(Printer, PO);
 }
 
+void SwiftLangSupport::printFullyAnnotatedSynthesizedDeclaration(
+    const swift::ExtensionDecl *ED, TypeOrExtensionDecl Target,
+    llvm::raw_ostream &OS) {
+  FullyAnnotatedDeclarationPrinter Printer(OS);
+  PrintOptions PO = PrintOptions::printQuickHelpDeclaration();
+  PO.initForSynthesizedExtension(Target);
+  ED->print(Printer, PO);
+}
+
 template <typename FnTy>
 void walkRelatedDecls(const ValueDecl *VD, const FnTy &Fn) {
   llvm::SmallDenseMap<DeclName, unsigned, 16> NamesSeen;
-  ++NamesSeen[VD->getFullName()];
+  ++NamesSeen[VD->getName()];
   SmallVector<LookupResultEntry, 8> RelatedDecls;
 
   if (isa<ParamDecl>(VD))
@@ -491,18 +493,20 @@ void walkRelatedDecls(const ValueDecl *VD, const FnTy &Fn) {
 
   // FIXME: Extract useful related declarations, overloaded functions,
   // if VD is an initializer, we should extract other initializers etc.
-  // For now we use UnqualifiedLookup to fetch other declarations with the same
+  // For now we use unqualified lookup to fetch other declarations with the same
   // base name.
-  auto TypeResolver = VD->getASTContext().getLazyResolver();
-  UnqualifiedLookup Lookup(VD->getBaseName(), VD->getDeclContext(),
-                           TypeResolver);
-  for (auto result : Lookup.Results) {
+  auto &ctx = VD->getASTContext();
+  auto descriptor = UnqualifiedLookupDescriptor(DeclNameRef(VD->getBaseName()),
+                                                VD->getDeclContext());
+  auto lookup = evaluateOrDefault(ctx.evaluator,
+                                  UnqualifiedLookupRequest{descriptor}, {});
+  for (auto result : lookup) {
     ValueDecl *RelatedVD = result.getValueDecl();
     if (RelatedVD->getAttrs().isUnavailable(VD->getASTContext()))
       continue;
 
     if (RelatedVD != VD) {
-      ++NamesSeen[RelatedVD->getFullName()];
+      ++NamesSeen[RelatedVD->getName()];
       RelatedDecls.push_back(result);
     }
   }
@@ -512,7 +516,7 @@ void walkRelatedDecls(const ValueDecl *VD, const FnTy &Fn) {
   for (auto Related : RelatedDecls) {
     ValueDecl *RelatedVD = Related.getValueDecl();
     bool SameBase = Related.getBaseDecl() && Related.getBaseDecl() == OriginalBase;
-    Fn(RelatedVD, SameBase, NamesSeen[RelatedVD->getFullName()] > 1);
+    Fn(RelatedVD, SameBase, NamesSeen[RelatedVD->getName()] > 1);
   }
 }
 
@@ -624,7 +628,7 @@ static bool passCursorInfoForModule(ModuleEntity Mod,
                                     SwiftInterfaceGenMap &IFaceGenContexts,
                                     const CompilerInvocation &Invok,
                        std::function<void(const RequestResult<CursorInfoData> &)> Receiver) {
-  std::string Name = Mod.getName();
+  std::string Name = Mod.getName().str();
   std::string FullName = Mod.getFullName();
   CursorInfoData Info;
   Info.Kind = SwiftLangSupport::getUIDForModuleRef();
@@ -644,11 +648,13 @@ static bool passCursorInfoForModule(ModuleEntity Mod,
 
 static void
 collectAvailableRenameInfo(const ValueDecl *VD,
+                           Optional<RenameRefInfo> RefInfo,
                            std::vector<UIdent> &RefactoringIds,
                            DelayedStringRetriever &RefactroingNameOS,
                            DelayedStringRetriever &RefactoringReasonOS) {
   std::vector<ide::RenameAvailabiliyInfo> Scratch;
-  for (auto Info : ide::collectRenameAvailabilityInfo(VD, Scratch)) {
+  for (auto Info : ide::collectRenameAvailabilityInfo(VD, RefInfo,
+                                                      Scratch)){
     RefactoringIds.push_back(SwiftLangSupport::
       getUIDForRefactoringKind(Info.Kind));
     RefactroingNameOS.startPiece();
@@ -719,7 +725,7 @@ getParamParentNameOffset(const ValueDecl *VD, SourceLoc Cursor) {
 /// Returns true on success, false on error (and sets `Diagnostic` accordingly).
 static bool passCursorInfoForDecl(SourceFile* SF,
                                   const ValueDecl *VD,
-                                  const ModuleDecl *MainModule,
+                                  ModuleDecl *MainModule,
                                   const Type ContainerTy,
                                   bool IsRef,
                                   bool RetrieveRefactoring,
@@ -776,12 +782,11 @@ static bool passCursorInfoForDecl(SourceFile* SF,
   unsigned USREnd = SS.size();
 
   unsigned TypenameBegin = SS.size();
-  if (VD->hasInterfaceType()) {
-    llvm::raw_svector_ostream OS(SS);
-    PrintOptions Options;
-    Options.PrintTypeAliasUnderlyingType = true;
-    VD->getInterfaceType().print(OS, Options);
-  }
+  llvm::raw_svector_ostream OS(SS);
+  PrintOptions Options;
+  Options.PrintTypeAliasUnderlyingType = true;
+  VD->getInterfaceType().print(OS, Options);
+
   unsigned TypenameEnd = SS.size();
 
   unsigned MangledTypeStart = SS.size();
@@ -841,8 +846,13 @@ static bool passCursorInfoForDecl(SourceFile* SF,
   std::vector<UIdent> RefactoringIds;
   DelayedStringRetriever RefactoringNameOS(SS);
   DelayedStringRetriever RefactoringReasonOS(SS);
+
   if (RetrieveRefactoring) {
-    collectAvailableRenameInfo(VD, RefactoringIds, RefactoringNameOS,
+    Optional<RenameRefInfo> RefInfo;
+    if (TheTok.IsRef)
+      RefInfo = {TheTok.SF, TheTok.Loc, TheTok.IsKeywordArgument};
+    collectAvailableRenameInfo(VD, RefInfo,
+                               RefactoringIds, RefactoringNameOS,
                                RefactoringReasonOS);
     collectAvailableRefactoringsOtherThanRename(SF, TheTok, RefactoringIds,
       RefactoringNameOS, RefactoringReasonOS);
@@ -909,8 +919,13 @@ static bool passCursorInfoForDecl(SourceFile* SF,
     auto ClangMod = Importer->getClangOwningModule(ClangNode);
     if (ClangMod)
       ModuleName = ClangMod->getFullModuleName();
-  } else if (VD->getLoc().isInvalid() && VD->getModuleContext() != MainModule) {
-    ModuleName = VD->getModuleContext()->getName().str();
+  } else if (VD->getModuleContext() != MainModule) {
+    ModuleDecl *MD = VD->getModuleContext();
+    // If the decl is from a cross-import overlay module, report the overlay's
+    // declaring module as the owning module.
+    if (ModuleDecl *Declaring = MD->getDeclaringModuleIfCrossImportOverlay())
+      MD = Declaring;
+    ModuleName = MD->getNameStr().str();
   }
   StringRef ModuleInterfaceName;
   if (auto IFaceGenRef = Lang.getIFaceGenContexts().find(ModuleName, Invok))
@@ -1044,7 +1059,7 @@ static DeclName getSwiftDeclName(const ValueDecl *VD,
                                  NameTranslatingInfo &Info) {
   auto &Ctx = VD->getDeclContext()->getASTContext();
   assert(SwiftLangSupport::getNameKindForUID(Info.NameKind) == NameKind::Swift);
-  DeclName OrigName = VD->getFullName();
+  const DeclName OrigName = VD->getName();
   DeclBaseName BaseName = Info.BaseName.empty()
                               ? OrigName.getBaseName()
                               : DeclBaseName(
@@ -1154,7 +1169,7 @@ class CursorRangeInfoConsumer : public SwiftASTConsumer {
 protected:
   SwiftLangSupport &Lang;
   SwiftInvocationRef ASTInvok;
-  StringRef InputFile;
+  std::string InputFile;
   unsigned Offset;
   unsigned Length;
 
@@ -1173,7 +1188,7 @@ public:
   CursorRangeInfoConsumer(StringRef InputFile, unsigned Offset, unsigned Length,
                           SwiftLangSupport &Lang, SwiftInvocationRef ASTInvok,
                           bool TryExistingAST, bool CancelOnSubsequentRequest)
-    : Lang(Lang), ASTInvok(ASTInvok),InputFile(InputFile), Offset(Offset),
+    : Lang(Lang), ASTInvok(ASTInvok),InputFile(InputFile.str()), Offset(Offset),
       Length(Length), TryExistingAST(TryExistingAST),
       CancelOnSubsequentRequest(CancelOnSubsequentRequest) {}
 
@@ -1192,8 +1207,8 @@ public:
     ImmutableTextSnapshotRef InputSnap;
     if (auto EditorDoc = Lang.getEditorDocuments()->findByPath(InputFile))
       InputSnap = EditorDoc->getLatestSnapshot();
-      if (!InputSnap)
-        return false;
+    if (!InputSnap)
+      return false;
 
     auto mappedBackOffset = [&]()->llvm::Optional<unsigned> {
       for (auto &Snap : Snapshots) {
@@ -1287,7 +1302,7 @@ static void resolveCursor(
         std::vector<RefactoringKind> Scratch;
         RangeConfig Range;
         Range.BufferId = BufferID;
-        auto Pair = SM.getLineAndColumn(Loc);
+        auto Pair = SM.getPresumedLineAndColumnForLoc(Loc);
         Range.Line = Pair.first;
         Range.Column = Pair.second;
         Range.Length = Length;
@@ -1646,10 +1661,9 @@ void SwiftLangSupport::getCursorInfo(
                                   Receiver);
         } else {
           std::string Diagnostic;  // Unused.
-          // FIXME: Should pass the main module for the interface but currently
-          // it's not necessary.
+          ModuleDecl *MainModule = IFaceGenRef->getModuleDecl();
           passCursorInfoForDecl(
-              /*SourceFile*/nullptr, Entity.Dcl, /*MainModule*/ nullptr,
+              /*SourceFile*/nullptr, Entity.Dcl, MainModule,
               Type(), Entity.IsRef, Actionables, ResolvedCursorInfo(),
               /*OrigBufferID=*/None, SourceLoc(),
               {}, *this, Invok, Diagnostic, {}, Receiver);
@@ -2159,7 +2173,7 @@ semanticRefactoring(StringRef Filename, SemanticRefactoringInfo Info,
       Opts.Range.Line = Info.Line;
       Opts.Range.Column = Info.Column;
       Opts.Range.Length = Info.Length;
-      Opts.PreferredName = Info.PreferredName;
+      Opts.PreferredName = Info.PreferredName.str();
 
       RequestRefactoringEditConsumer EditConsumer(Receiver);
       refactorSwiftModule(MainModule, Opts, EditConsumer, EditConsumer);

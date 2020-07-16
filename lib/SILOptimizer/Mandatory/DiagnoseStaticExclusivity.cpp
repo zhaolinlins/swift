@@ -75,9 +75,9 @@ private:
   union {
    BeginAccessInst *Inst;
     struct {
-      SILAccessKind ClosureAccessKind;
-      SILLocation ClosureAccessLoc;
-    };
+      SILAccessKind AccessKind;
+      SILLocation AccessLoc;
+    } Closure;
   };
 
   const IndexTrieNode *SubPath;
@@ -89,7 +89,7 @@ public:
   RecordedAccess(SILAccessKind ClosureAccessKind,
                  SILLocation ClosureAccessLoc, const IndexTrieNode *SubPath) :
       RecordKind(RecordedAccessKind::NoescapeClosureCapture),
-      ClosureAccessKind(ClosureAccessKind), ClosureAccessLoc(ClosureAccessLoc),
+      Closure({ClosureAccessKind, ClosureAccessLoc}),
       SubPath(SubPath) { }
 
   RecordedAccessKind getRecordKind() const {
@@ -106,7 +106,7 @@ public:
       case RecordedAccessKind::BeginInstruction:
         return Inst->getAccessKind();
       case RecordedAccessKind::NoescapeClosureCapture:
-        return ClosureAccessKind;
+        return Closure.AccessKind;
     };
     llvm_unreachable("unhandled kind");
   }
@@ -116,7 +116,7 @@ public:
       case RecordedAccessKind::BeginInstruction:
         return Inst->getLoc();
       case RecordedAccessKind::NoescapeClosureCapture:
-        return ClosureAccessLoc;
+        return Closure.AccessLoc;
     };
     llvm_unreachable("unhandled kind");
   }
@@ -154,17 +154,17 @@ public:
     }
 
     if (BAI->getAccessKind() == SILAccessKind::Read)
-      Reads++;
+      ++Reads;
     else
-      NonReads++;
+      ++NonReads;
   }
 
   /// Decrement the count for given access.
   void endAccess(EndAccessInst *EAI) {
     if (EAI->getBeginAccess()->getAccessKind() == SILAccessKind::Read)
-      Reads--;
+      --Reads;
     else
-      NonReads--;
+      --NonReads;
 
     // If all open accesses are now ended, forget the location of the
     // first access.
@@ -499,12 +499,14 @@ static void addSwapAtFixit(InFlightDiagnostic &Diag, CallExpr *&FoundCall,
 /// and tuple elements.
 static std::string getPathDescription(DeclName BaseName, SILType BaseType,
                                       const IndexTrieNode *SubPath,
-                                      SILModule &M) {
+                                      SILModule &M,
+                                      TypeExpansionContext context) {
   std::string sbuf;
   llvm::raw_string_ostream os(sbuf);
 
   os << "'" << BaseName;
-  os << AccessSummaryAnalysis::getSubPathDescription(BaseType, SubPath, M);
+  os << AccessSummaryAnalysis::getSubPathDescription(BaseType, SubPath, M,
+                                                     context);
   os << "'";
 
   return os.str();
@@ -547,7 +549,8 @@ static void diagnoseExclusivityViolation(const ConflictingAccess &Violation,
     SILType BaseType = FirstAccess.getInstruction()->getType().getAddressType();
     SILModule &M = FirstAccess.getInstruction()->getModule();
     std::string PathDescription = getPathDescription(
-        VD->getBaseName(), BaseType, MainAccess.getSubPath(), M);
+        VD->getBaseName(), BaseType, MainAccess.getSubPath(), M,
+        TypeExpansionContext(*FirstAccess.getInstruction()->getFunction()));
 
     // Determine whether we can safely suggest replacing the violation with
     // a call to MutableCollection.swapAt().
@@ -883,17 +886,15 @@ static void checkForViolationsAtInstruction(SILInstruction &I,
       });
   }
 
-  if (auto *AI = dyn_cast<ApplyInst>(&I)) {
-    // Record calls to swap() for potential Fix-Its.
-    if (isCallToStandardLibrarySwap(AI, I.getFunction()->getASTContext()))
-      State.CallsToSwap.push_back(AI);
-    else
-      checkForViolationAtApply(AI, State);
-    return;
-  }
-
-  if (auto *TAI = dyn_cast<TryApplyInst>(&I)) {
-    checkForViolationAtApply(TAI, State);
+  if (auto apply = FullApplySite::isa(&I)) {
+    if (auto *AI = dyn_cast<ApplyInst>(&I)) {
+      // Record calls to swap() for potential Fix-Its.
+      if (isCallToStandardLibrarySwap(AI, I.getFunction()->getASTContext())) {
+        State.CallsToSwap.push_back(AI);
+        return;
+      }
+    }
+    checkForViolationAtApply(apply, State);
     return;
   }
 

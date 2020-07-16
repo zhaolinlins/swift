@@ -106,7 +106,7 @@ private extension PublicStruct {
   private func extImplPrivate() {}
 }
 public extension InternalStruct { // expected-error {{extension of internal struct cannot be declared public}} {{1-8=}}
-  public func extMemberPublic() {} // expected-warning {{'public' modifier is redundant for instance method declared in a public extension}} {{3-10=}}
+  public func extMemberPublic() {}
   fileprivate func extFuncPublic() {}
   private func extImplPublic() {}
 }
@@ -126,12 +126,12 @@ private extension InternalStruct {
   private func extImplPrivate() {}
 }
 public extension FilePrivateStruct { // expected-error {{extension of fileprivate struct cannot be declared public}} {{1-8=}}
-  public func extMemberPublic() {} // expected-warning {{'public' modifier is redundant for instance method declared in a public extension}} {{3-10=}}
+  public func extMemberPublic() {}
   fileprivate func extFuncPublic() {}
   private func extImplPublic() {}
 }
 internal extension FilePrivateStruct { // expected-error {{extension of fileprivate struct cannot be declared internal}} {{1-10=}}
-  public func extMemberInternal() {} // expected-warning {{'public' modifier conflicts with extension's default access of 'internal'}} {{none}}
+  public func extMemberInternal() {}
   fileprivate func extFuncInternal() {}
   private func extImplInternal() {}
 }
@@ -146,18 +146,18 @@ private extension FilePrivateStruct {
   private func extImplPrivate() {}
 }
 public extension PrivateStruct { // expected-error {{extension of private struct cannot be declared public}} {{1-8=}}
-  public func extMemberPublic() {} // expected-warning {{'public' modifier is redundant for instance method declared in a public extension}} {{3-10=}}
+  public func extMemberPublic() {}
   fileprivate func extFuncPublic() {}
   private func extImplPublic() {}
 }
 internal extension PrivateStruct { // expected-error {{extension of private struct cannot be declared internal}} {{1-10=}}
-  public func extMemberInternal() {} // expected-warning {{'public' modifier conflicts with extension's default access of 'internal'}} {{none}}
+  public func extMemberInternal() {}
   fileprivate func extFuncInternal() {}
   private func extImplInternal() {}
 }
 fileprivate extension PrivateStruct { // expected-error {{extension of private struct cannot be declared fileprivate}} {{1-13=}}
-  public func extMemberFilePrivate() {} // expected-warning {{'public' modifier conflicts with extension's default access of 'fileprivate'}} {{none}}
-  fileprivate func extFuncFilePrivate() {} // expected-warning {{'fileprivate' modifier is redundant for instance method declared in a fileprivate extension}} {{3-15=}}
+  public func extMemberFilePrivate() {}
+  fileprivate func extFuncFilePrivate() {}
   private func extImplFilePrivate() {}
 }
 private extension PrivateStruct {
@@ -434,6 +434,15 @@ public protocol PublicRefinesPrivate : PrivateProto {} // expected-error {{publi
 public protocol PublicRefinesInternal : InternalProto {} // expected-error {{public protocol cannot refine an internal protocol}}
 public protocol PublicRefinesPI : PrivateProto, InternalProto {} // expected-error {{public protocol cannot refine a private protocol}}
 public protocol PublicRefinesIP : InternalProto, PrivateProto {} // expected-error {{public protocol cannot refine a private protocol}}
+
+private typealias PrivateTypeAlias = PublicProto; // expected-note {{type declared here}}
+private typealias PrivateCompoundTypeAlias = PublicProto & AnyObject // expected-note {{type declared here}}
+
+protocol DefaultRefinesPrivateClass: PrivateClass {} // expected-error {{protocol must be declared private or fileprivate because it refines a private class}}
+public protocol PublicRefinesPrivateClass: PrivateClass {} // expected-error {{public protocol cannot refine a private class}}
+public protocol PublicRefinesPrivateTypeAlias: PrivateTypeAlias {} // expected-error {{public protocol cannot refine a private type alias}}
+public protocol PublicRefinesPrivateCompoundTypeAlias: PrivateCompoundTypeAlias {} // expected-error {{public protocol cannot refine a private type alias}}
+
 
 
 // expected-note@+1 * {{type declared here}}

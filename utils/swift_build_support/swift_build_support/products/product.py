@@ -13,6 +13,11 @@
 import abc
 
 from .. import cmake
+from .. import targets
+
+
+def is_release_variant(build_variant):
+    return build_variant in ['Release', 'RelWithDebInfo']
 
 
 class Product(object):
@@ -32,6 +37,16 @@ class Product(object):
         It provides a customization point for Product subclasses. It is set to
         the value of product_name() by default for this reason.
         """
+
+        llvm_projects = ['clang',
+                         'clang-tools-extra',
+                         'compiler-rt',
+                         'libcxx',
+                         'lldb',
+                         'llvm']
+
+        if cls.product_name() in llvm_projects:
+            return "llvm-project/{}".format(cls.product_name())
         return cls.product_name()
 
     @classmethod
@@ -40,12 +55,47 @@ class Product(object):
 
         Whether this product is produced by build-script-impl.
         """
-        return True
+        raise NotImplementedError
+
+    @classmethod
+    def is_swiftpm_unified_build_product(cls):
+        """is_swiftpm_unified_build_product -> bool
+
+        Whether this product should be built in the unified build of SwiftPM
+        products.
+        """
+        return False
+
+    @classmethod
+    def is_nondarwin_only_build_product(cls):
+        """Returns true if this target should be skipped in darwin builds when
+        inferring dependencies.
+        """
+        return False
+
+    @classmethod
+    def get_dependencies(cls):
+        """Return a list of products that this product depends upon"""
+        raise NotImplementedError
+
+    def should_build(self, host_target):
+        """should_build() -> Bool
+
+        Whether or not this product should be built with the given arguments.
+        """
+        raise NotImplementedError
 
     def build(self, host_target):
         """build() -> void
 
         Perform the build, for a non-build-script-impl product.
+        """
+        raise NotImplementedError
+
+    def should_test(self, host_target):
+        """should_test() -> Bool
+
+        Whether or not this product should be tested with the given arguments.
         """
         raise NotImplementedError
 
@@ -56,12 +106,56 @@ class Product(object):
         """
         raise NotImplementedError
 
+    def should_install(self, host_target):
+        """should_install() -> Bool
+
+        Whether or not this product should be installed with the given
+        arguments.
+        """
+        raise NotImplementedError
+
+    def install(self, host_target):
+        """install() -> void
+
+        Install to the toolchain, for a non-build-script-impl product.
+        """
+        raise NotImplementedError
+
     def __init__(self, args, toolchain, source_dir, build_dir):
+        """
+        Parameters
+        ----------
+        args : `argparse.Namespace`
+            The arguments passed by the user to the invocation of the script.
+        toolchain : `swift_build_support.toolchain.Toolchain`
+            The toolchain being used to build the product. The toolchain will
+            point to the tools that the builder should use to build (like the
+            compiler or the linker).
+        build_dir: string
+            The directory in which the product should put all of its build
+            products.
+        """
         self.args = args
         self.toolchain = toolchain
         self.source_dir = source_dir
         self.build_dir = build_dir
         self.cmake_options = cmake.CMakeOptions()
+
+    def is_release(self):
+        """is_release() -> Bool
+
+        Whether or not this target is built as a release variant
+        """
+        return is_release_variant(self.args.build_variant)
+
+    def install_toolchain_path(self):
+        """toolchain_path() -> string
+
+        Returns the path to the toolchain that is being created as part of this
+        build.
+        """
+        return targets.toolchain_path(self.args.install_destdir,
+                                      self.args.install_prefix)
 
 
 class ProductBuilder(object):

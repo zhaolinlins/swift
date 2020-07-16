@@ -56,6 +56,8 @@ public:
   /// Create a scope for an artificial function.
   SILDebugScope(SILLocation Loc);
 
+  SILLocation getLoc() const { return Loc; }
+
   /// Return the function this scope originated from before being inlined.
   SILFunction *getInlinedFunction() const;
 
@@ -64,12 +66,10 @@ public:
   /// into.
   SILFunction *getParentFunction() const;
 
-#ifndef NDEBUG
-  LLVM_ATTRIBUTE_DEPRECATED(void dump(SourceManager &SM, llvm::raw_ostream &OS = llvm::errs(),
-                            unsigned Indent = 0) const,
-                  "only for use in the debugger");
-  LLVM_ATTRIBUTE_DEPRECATED(void dump(SILModule &Mod) const, "only for use in the debugger");
-#endif
+  void print(SourceManager &SM, llvm::raw_ostream &OS = llvm::errs(),
+             unsigned Indent = 0) const;
+
+  void print(SILModule &Mod) const;
 };
 
 /// Determine whether an instruction may not have a SILDebugScope.

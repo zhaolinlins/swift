@@ -215,6 +215,7 @@ static bool readCachedModule(llvm::MemoryBuffer *in,
     auto opKind = static_cast<CodeCompletionOperatorKind>(*cursor++);
     auto context = static_cast<SemanticContextKind>(*cursor++);
     auto notRecommended = static_cast<bool>(*cursor++);
+    auto isSystem = static_cast<bool>(*cursor++);
     auto numBytesToErase = static_cast<unsigned>(*cursor++);
     auto oldCursor = cursor;
     auto chunkIndex = read32le(cursor);
@@ -248,14 +249,15 @@ static bool readCachedModule(llvm::MemoryBuffer *in,
     CodeCompletionResult *result = nullptr;
     if (kind == CodeCompletionResult::Declaration) {
       result = new (*V.Sink.Allocator) CodeCompletionResult(
-          context, numBytesToErase, string, declKind, moduleName,
+          context, numBytesToErase, string, declKind, isSystem, moduleName,
           notRecommended, CodeCompletionResult::NotRecommendedReason::NoReason,
           briefDocComment, copyStringArray(*V.Sink.Allocator, assocUSRs),
-          copyStringPairArray(*V.Sink.Allocator, declKeywords), opKind);
+          copyStringPairArray(*V.Sink.Allocator, declKeywords),
+          CodeCompletionResult::Unknown, opKind);
     } else {
       result = new (*V.Sink.Allocator)
           CodeCompletionResult(kind, context, numBytesToErase, string,
-                               CodeCompletionResult::Unrelated, opKind);
+                               CodeCompletionResult::NotApplicable, opKind);
     }
 
     V.Sink.Results.push_back(result);
@@ -314,6 +316,7 @@ static void writeCachedModule(llvm::raw_ostream &out,
     OSSLE.write(K.ForTestableLookup);
     OSSLE.write(K.ForPrivateImportLookup);
     OSSLE.write(K.CodeCompleteInitsInPostfixExpr);
+    OSSLE.write(K.Annotated);
     LE.write(static_cast<uint32_t>(OSS.tell()));   // Size of debug info
     out.write(OSS.str().data(), OSS.str().size()); // Debug info blob
   }
@@ -369,6 +372,7 @@ static void writeCachedModule(llvm::raw_ostream &out,
         LE.write(static_cast<uint8_t>(CodeCompletionOperatorKind::None));
       LE.write(static_cast<uint8_t>(R->getSemanticContext()));
       LE.write(static_cast<uint8_t>(R->isNotRecommended()));
+      LE.write(static_cast<uint8_t>(R->isSystem()));
       LE.write(static_cast<uint8_t>(R->getNumBytesToErase()));
       LE.write(
           static_cast<uint32_t>(addCompletionString(R->getCompletionString())));
@@ -425,7 +429,8 @@ static std::string getName(StringRef cacheDirectory,
   OSS << (K.ResultsHaveLeadingDot ? "-dot" : "")
       << (K.ForTestableLookup ? "-testable" : "")
       << (K.ForPrivateImportLookup ? "-private" : "")
-      << (K.CodeCompleteInitsInPostfixExpr ? "-inits" : "");
+      << (K.CodeCompleteInitsInPostfixExpr ? "-inits" : "")
+      << (K.Annotated ? "-annotated" : "");
 
   // name[-access-path-components]
   for (StringRef component : K.AccessPath)
@@ -437,7 +442,7 @@ static std::string getName(StringRef cacheDirectory,
   llvm::APInt(64, uint64_t(hash)).toStringUnsigned(hashStr, /*Radix*/ 36);
   OSS << "-" << hashStr << ".completions";
 
-  return name.str();
+  return std::string(name.str());
 }
 
 Optional<CodeCompletionCache::ValueRefCntPtr>
@@ -490,8 +495,8 @@ OnDiskCodeCompletionCache::getFromFile(StringRef filename) {
     return None;
 
   // Make up a key for readCachedModule.
-  CodeCompletionCache::Key K{filename, "<module-name>", {},   false,
-                             false,    false,           false};
+  CodeCompletionCache::Key K{filename.str(), "<module-name>", {},   false,
+                             false,          false,           false, false};
 
   // Read the cached results.
   auto V = CodeCompletionCache::createValue();

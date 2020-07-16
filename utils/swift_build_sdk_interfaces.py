@@ -105,7 +105,7 @@ def run_command(args, dry_run):
     try:
         out, err = proc.communicate()
         exitcode = proc.returncode
-        return (exitcode, out, err)
+        return (exitcode, out.decode('utf-8'), err.decode('utf-8'))
     except KeyboardInterrupt:
         proc.terminate()
         raise
@@ -241,29 +241,11 @@ def looks_like_iosmac(interface_base):
     return 'ios-macabi' in interface_base
 
 
-def rename_interface_for_iosmac_if_needed(interface_base, module_path):
-    """Hack: Both macOS and iOSMac use 'x86_64' as the short name for a module
-    interface file, and while we want to move away from this it's something we
-    need to handle in the short term. Manually rename these to the full form of
-    the target-specific module when we're obviously on macOS or iOSMac.
-    """
-    if interface_base != 'x86_64':
-        return interface_base
-    if '/iOSSupport/' in module_path:
-        return 'x86_64-apple-ios-macabi'
-    if '/MacOS' in module_path:
-        return 'x86_64-apple-macos'
-    return interface_base
-
-
 def process_module(module_file):
     global args, shared_output_lock
     try:
         interface_base, _ = \
             os.path.splitext(os.path.basename(module_file.path))
-        interface_base = \
-            rename_interface_for_iosmac_if_needed(interface_base,
-                                                  module_file.path)
 
         swiftc = os.getenv('SWIFT_EXEC',
                            os.path.join(os.path.dirname(__file__), 'swiftc'))
@@ -402,9 +384,18 @@ def main():
             xfails = json.load(xfails_file)
 
     make_dirs_if_needed(args.output_dir, args.dry_run)
-    shared_output_lock = multiprocessing.Lock()
-    pool = multiprocessing.Pool(args.jobs, set_up_child,
-                                (args, shared_output_lock))
+    if 'ANDROID_DATA' not in os.environ:
+        shared_output_lock = multiprocessing.Lock()
+        pool = multiprocessing.Pool(args.jobs, set_up_child,
+                                    (args, shared_output_lock))
+    else:
+        # Android doesn't support Python's multiprocessing as it doesn't have
+        # sem_open, so switch to a ThreadPool instead.
+        import threading
+        shared_output_lock = threading.Lock()
+        from multiprocessing.pool import ThreadPool
+        pool = ThreadPool(args.jobs, set_up_child,
+                          (args, shared_output_lock))
 
     interface_framework_dirs = (args.interface_framework_dirs or
                                 DEFAULT_FRAMEWORK_INTERFACE_SEARCH_PATHS)
@@ -425,6 +416,10 @@ def main():
     non_stdlib_module_files = (
         x for x in module_files if x.name != STDLIB_NAME)
     status = process_module_files(pool, non_stdlib_module_files)
+    if os.name == 'nt':
+        import ctypes
+        Kernel32 = ctypes.cdll.LoadLibrary("Kernel32.dll")
+        Kernel32.ExitProcess(ctypes.c_ulong(status))
     sys.exit(status)
 
 

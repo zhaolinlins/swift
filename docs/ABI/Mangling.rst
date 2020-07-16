@@ -171,6 +171,8 @@ Globals
   global ::= entity 'Wvd'                // field offset
   global ::= entity 'WC'                 // resilient enum tag index
 
+  global ::= global 'MK'                 // instantiation cache associated with global
+
 A direct symbol resolves directly to the address of an object.  An
 indirect symbol resolves to the address of a pointer to the object.
 They are distinct manglings to make a certain class of bugs
@@ -290,6 +292,7 @@ Entities
   entity-spec ::= type 'fu' INDEX            // implicit anonymous closure
   entity-spec ::= 'fA' INDEX                 // default argument N+1 generator
   entity-spec ::= 'fi'                       // non-local variable initializer
+  entity-spec ::= 'fP'                       // property wrapper backing initializer
   entity-spec ::= 'fD'                       // deallocating destructor; untyped
   entity-spec ::= 'fd'                       // non-deallocating destructor; untyped
   entity-spec ::= 'fE'                       // ivar destroyer; untyped
@@ -480,7 +483,7 @@ Types
   type ::= 'Bf' NATURAL '_'                  // Builtin.Float<n>
   type ::= 'Bi' NATURAL '_'                  // Builtin.Int<n>
   type ::= 'BI'                              // Builtin.IntLiteral
-  type ::= 'BO'                              // Builtin.UnknownObject
+  type ::= 'BO'                              // Builtin.UnknownObject (no longer a distinct type, but still used for AnyObject)
   type ::= 'Bo'                              // Builtin.NativeObject
   type ::= 'Bp'                              // Builtin.RawPointer
   type ::= 'Bt'                              // Builtin.SILToken
@@ -516,6 +519,10 @@ Types
   FUNCTION-KIND ::= 'C'                      // C function pointer type
   FUNCTION-KIND ::= 'A'                      // @auto_closure function type (escaping)
   FUNCTION-KIND ::= 'E'                      // function type (noescape)
+  FUNCTION-KIND ::= 'F'                      // @differentiable function type
+  FUNCTION-KIND ::= 'G'                      // @differentiable function type (escaping)
+  FUNCTION-KIND ::= 'H'                      // @differentiable(linear) function type
+  FUNCTION-KIND ::= 'I'                      // @differentiable(linear) function type (escaping)
 
   function-signature ::= params-type params-type throws? // results and parameters
 
@@ -551,6 +558,11 @@ Types
   type ::= assoc-type-name 'Qz'                      // shortcut for 'Qyz'
   type ::= assoc-type-list 'QY' GENERIC-PARAM-INDEX  // associated type at depth
   type ::= assoc-type-list 'QZ'                      // shortcut for 'QYz'
+  
+  #if SWIFT_RUNTIME_VERSION >= 5.2
+    type ::= type assoc-type-name 'Qx' // associated type relative to base `type`
+    type ::= type assoc-type-list 'QX' // associated type relative to base `type`
+  #endif
 
   protocol-list ::= protocol '_' protocol*
   protocol-list ::= empty-list
@@ -577,13 +589,19 @@ mangled in to disambiguate.
 ::
 
   impl-function-type ::= type* 'I' FUNC-ATTRIBUTES '_'
-  impl-function-type ::= type* generic-signature 'I' PSEUDO-GENERIC? FUNC-ATTRIBUTES '_'
+  impl-function-type ::= type* generic-signature 'I' FUNC-ATTRIBUTES '_'
 
-  FUNC-ATTRIBUTES ::= CALLEE-ESCAPE? CALLEE-CONVENTION FUNC-REPRESENTATION? PARAM-CONVENTION* RESULT-CONVENTION* ('z' RESULT-CONVENTION)
+  FUNC-ATTRIBUTES ::= PATTERN-SUBS? INVOCATION-SUBS? PSEUDO-GENERIC? CALLEE-ESCAPE? DIFFERENTIABILITY-KIND? CALLEE-CONVENTION FUNC-REPRESENTATION? COROUTINE-KIND? (PARAM-CONVENTION PARAM-DIFFERENTIABILITY?)* RESULT-CONVENTION* ('Y' PARAM-CONVENTION)* ('z' RESULT-CONVENTION RESULT-DIFFERENTIABILITY?)?
 
+  PATTERN-SUBS ::= 's'                       // has pattern substitutions
+  INVOCATION-SUB ::= 'I'                     // has invocation substitutions
   PSEUDO-GENERIC ::= 'P'
 
   CALLEE-ESCAPE ::= 'e'                      // @escaping (inverse of SIL @noescape)
+
+  DIFFERENTIABILITY-KIND ::= DIFFERENTIABLE | LINEAR
+  DIFFERENTIABLE ::= 'd'                     // @differentiable
+  LINEAR ::= 'l'                             // @differentiable(linear)
 
   CALLEE-CONVENTION ::= 'y'                  // @callee_unowned
   CALLEE-CONVENTION ::= 'g'                  // @callee_guaranteed
@@ -597,6 +615,9 @@ mangled in to disambiguate.
   FUNC-REPRESENTATION ::= 'K'                // closure
   FUNC-REPRESENTATION ::= 'W'                // protocol witness
 
+  COROUTINE-KIND ::= 'A'                     // yield-once coroutine
+  COROUTINE-KIND ::= 'G'                     // yield-many coroutine
+
   PARAM-CONVENTION ::= 'i'                   // indirect in
   PARAM-CONVENTION ::= 'c'                   // indirect in constant
   PARAM-CONVENTION ::= 'l'                   // indirect inout
@@ -607,11 +628,15 @@ mangled in to disambiguate.
   PARAM-CONVENTION ::= 'g'                   // direct guaranteed
   PARAM-CONVENTION ::= 'e'                   // direct deallocating
 
+  PARAM-DIFFERENTIABILITY ::= 'w'            // @noDerivative
+
   RESULT-CONVENTION ::= 'r'                  // indirect
   RESULT-CONVENTION ::= 'o'                  // owned
   RESULT-CONVENTION ::= 'd'                  // unowned
   RESULT-CONVENTION ::= 'u'                  // unowned inner pointer
   RESULT-CONVENTION ::= 'a'                  // auto-released
+
+  RESULT-DIFFERENTIABILITY ::= 'w'            // @noDerivative
 
 For the most part, manglings follow the structure of formal language
 types.  However, in some cases it is more useful to encode the exact

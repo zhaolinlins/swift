@@ -17,7 +17,6 @@
 #include "swift/Basic/SupplementaryOutputPaths.h"
 #include "swift/Frontend/InputFile.h"
 #include "llvm/ADT/Hashing.h"
-#include "llvm/ADT/MapVector.h"
 
 #include <string>
 #include <vector>
@@ -173,7 +172,7 @@ public:
 
 private:
   friend class ArgsToFrontendOptionsConverter;
-  friend class ParseableInterfaceBuilder;
+  friend struct InterfaceSubContextDelegateImpl;
   void setMainAndSupplementaryOutputs(
       ArrayRef<std::string> outputFiles,
       ArrayRef<SupplementaryOutputPaths> supplementaryOutputs);
@@ -231,11 +230,15 @@ public:
 
   bool hasDependenciesPath() const;
   bool hasReferenceDependenciesPath() const;
+  bool hasSwiftRangesPath() const;
+  bool hasCompiledSourcePath() const;
   bool hasObjCHeaderOutputPath() const;
   bool hasLoadedModuleTracePath() const;
   bool hasModuleOutputPath() const;
   bool hasModuleDocOutputPath() const;
-  bool hasParseableInterfaceOutputPath() const;
+  bool hasModuleSourceInfoOutputPath() const;
+  bool hasModuleInterfaceOutputPath() const;
+  bool hasPrivateModuleInterfaceOutputPath() const;
   bool hasTBDPath() const;
 
   bool hasDependencyTrackerPath() const;

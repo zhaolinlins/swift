@@ -7,6 +7,9 @@
 // REQUIRES: executable_test
 // XFAIL: interpret
 
+// With a non-optimized stdlib the test takes very long.
+// REQUIRES: optimized_stdlib
+
 import StdlibUnittest
 import StdlibCollectionUnittest
 
@@ -22,11 +25,11 @@ import ucrt
 extension Collection {
   internal func index(_nth n: Int) -> Index {
     precondition(n >= 0)
-    return index(startIndex, offsetBy: numericCast(n))
+    return index(startIndex, offsetBy: n)
   }
   internal func index(_nthLast n: Int) -> Index {
     precondition(n >= 0)
-    return index(endIndex, offsetBy: -numericCast(n))
+    return index(endIndex, offsetBy: -n)
   }
 }
 
@@ -238,6 +241,10 @@ StringTests.test("ForeignIndexes/Valid") {
     let acceptor = "\u{1f601}\u{1f602}\u{1f603}"
     expectEqual("\u{1f601}", acceptor[donor.startIndex])
 
+    // Scalar alignment fixes and checks were added in 5.1, so we don't get the
+    // expected behavior on prior runtimes.
+    guard _hasSwift_5_1() else { return }
+
     // Donor's second index is scalar-aligned in donor, but not acceptor. This
     // will trigger a stdlib assertion.
     let donorSecondIndex = donor.index(after: donor.startIndex)
@@ -256,6 +263,10 @@ StringTests.test("ForeignIndexes/UnexpectedCrash") {
 
   // Adjust donor.startIndex to ensure it caches a stride
   let start = donor.index(before: donor.index(after: donor.startIndex))
+
+  // Grapheme stride cache under noop scalar alignment was fixed in 5.1, so we
+  // get a different answer prior.
+  guard _hasSwift_5_1() else { return }
 
   // `start` has a cached stride greater than 1, so subscript will trigger an
   // assertion when it makes a multi-grapheme-cluster Character.
@@ -1216,7 +1227,7 @@ StringTests.test("Conversions") {
 }
 
 
-#if os(Linux) || os(FreeBSD) || os(PS4) || os(Android) || os(Cygwin) || os(Haiku)
+#if canImport(Glibc)
   import Glibc
 #endif
 

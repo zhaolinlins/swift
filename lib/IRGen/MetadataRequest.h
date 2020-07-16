@@ -34,6 +34,7 @@ enum ForDefinition_t : bool;
 namespace irgen {
 class ConstantReference;
 class Explosion;
+struct GenericArguments;
 class IRGenFunction;
 class IRGenModule;
 class MetadataDependencyCollector;
@@ -372,6 +373,18 @@ public:
   static llvm::Constant *getCompletedState(IRGenModule &IGM);
 };
 
+inline llvm::raw_ostream &operator<<(llvm::raw_ostream &OS,
+                                     const MetadataResponse &MR) {
+  if (!MR.isValid())
+    return OS;
+  OS << MR.getMetadata();
+  if (MR.hasDynamicState())
+    OS << MR.getDynamicState();
+  // FIXME
+  // OS << MR.getStaticLowerBoundOnState();
+  return OS;
+}
+
 inline bool
 DynamicMetadataRequest::isSatisfiedBy(MetadataResponse response) const {
   return isSatisfiedBy(response.getStaticLowerBoundOnState());
@@ -487,9 +500,32 @@ static inline bool isAccessorLazilyGenerated(MetadataAccessStrategy strategy) {
   llvm_unreachable("bad kind");
 }
 
-/// Is it basically trivial to access the given metadata?  If so, we don't
-/// need a cache variable in its accessor.
-bool isTypeMetadataAccessTrivial(IRGenModule &IGM, CanType type);
+/// Is complete metadata for the given type available at a fixed address?
+bool isCompleteTypeMetadataStaticallyAddressable(IRGenModule &IGM, CanType type);
+/// Should requests for the given type's metadata be cached?
+bool shouldCacheTypeMetadataAccess(IRGenModule &IGM, CanType type);
+
+bool isInitializableTypeMetadataStaticallyAddressable(IRGenModule &IGM,
+                                                      CanType type);
+
+enum CanonicalSpecializedMetadataUsageIsOnlyFromAccessor : bool {
+  ForUseOnlyFromAccessor = true,
+  NotForUseOnlyFromAccessor = false
+};
+
+/// Is the address of the canonical specialization of a generic metadata
+/// statically known?
+///
+/// In other words, can a canonical specialization be formed for the specified
+/// type. If onlyFromAccess is ForUseOnlyFromAccessor, then metadata's address
+/// is known, but access to the metadata must go through the canonical
+/// specialized accessor so that initialization of the metadata can occur.
+bool isCanonicalSpecializedNominalTypeMetadataStaticallyAddressable(
+    IRGenModule &IGM, NominalTypeDecl &nominal, CanType type,
+    CanonicalSpecializedMetadataUsageIsOnlyFromAccessor onlyFromAccessor);
+
+bool isCompleteCanonicalSpecializedNominalTypeMetadataStaticallyAddressable(
+    IRGenModule &IGM, NominalTypeDecl &nominal, CanType type);
 
 /// Determine how the given type metadata should be accessed.
 MetadataAccessStrategy getTypeMetadataAccessStrategy(CanType type);
@@ -571,6 +607,13 @@ void emitCacheAccessFunction(IRGenModule &IGM,
                              CacheStrategy cacheStrategy,
                              CacheEmitter getValue,
                              bool isReadNone = true);
+MetadataResponse
+emitGenericTypeMetadataAccessFunction(IRGenFunction &IGF, Explosion &params,
+                                      NominalTypeDecl *nominal,
+                                      GenericArguments &genericArgs);
+
+MetadataResponse emitCanonicalSpecializedGenericTypeMetadataAccessFunction(
+    IRGenFunction &IGF, Explosion &params, CanType theType);
 
 /// Emit a declaration reference to a metatype object.
 void emitMetatypeRef(IRGenFunction &IGF, CanMetatypeType type,
@@ -582,10 +625,6 @@ void emitMetatypeRef(IRGenFunction &IGF, CanMetatypeType type,
 ConstantReference tryEmitConstantTypeMetadataRef(IRGenModule &IGM,
                                                  CanType type,
                                                  SymbolReferenceKind refKind);
-
-/// Get the type as it exists in Swift's runtime type system, removing any
-/// erased generic parameters.
-CanType getRuntimeReifiedType(IRGenModule &IGM, CanType type);
 
 /// Emit a reference to a compile-time constant piece of heap metadata, or
 /// return a null pointer if the type's heap metadata cannot be represented

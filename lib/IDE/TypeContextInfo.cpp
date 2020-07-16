@@ -19,6 +19,7 @@
 #include "swift/Sema/IDETypeChecking.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
+#include "llvm/ADT/SmallSet.h"
 
 using namespace swift;
 using namespace ide;
@@ -88,9 +89,7 @@ void ContextInfoCallbacks::doneParsing() {
   if (!ParsedExpr)
     return;
 
-  typeCheckContextUntil(
-      CurDeclContext,
-      CurDeclContext->getASTContext().SourceMgr.getCodeCompletionLoc());
+  typeCheckContextAt(CurDeclContext, ParsedExpr->getLoc());
 
   ExprContextInfo Info(CurDeclContext, ParsedExpr);
 
@@ -130,7 +129,6 @@ void ContextInfoCallbacks::getImplicitMembers(
 
   class LocalConsumer : public VisibleDeclConsumer {
     DeclContext *DC;
-    LazyResolver *TypeResolver;
     ModuleDecl *CurModule;
     Type T;
     SmallVectorImpl<ValueDecl *> &Result;
@@ -138,12 +136,6 @@ void ContextInfoCallbacks::getImplicitMembers(
     bool canBeImplictMember(ValueDecl *VD) {
       if (VD->isOperator())
         return false;
-
-      if (!VD->hasInterfaceType()) {
-        TypeResolver->resolveDeclSignature(VD);
-        if (!VD->hasInterfaceType())
-          return false;
-      }
 
       // Enum element decls can always be referenced by implicit member
       // expression.
@@ -163,8 +155,7 @@ void ContextInfoCallbacks::getImplicitMembers(
 
   public:
     LocalConsumer(DeclContext *DC, Type T, SmallVectorImpl<ValueDecl *> &Result)
-        : DC(DC), TypeResolver(DC->getASTContext().getLazyResolver()),
-          CurModule(DC->getParentModule()), T(T), Result(Result) {}
+        : DC(DC), CurModule(DC->getParentModule()), T(T), Result(Result) {}
 
     void foundDecl(ValueDecl *VD, DeclVisibilityKind Reason,
                    DynamicLookupInfo) {
@@ -175,8 +166,9 @@ void ContextInfoCallbacks::getImplicitMembers(
   } LocalConsumer(CurDeclContext, T, Result);
 
   lookupVisibleMemberDecls(LocalConsumer, MetatypeType::get(T), CurDeclContext,
-                           CurDeclContext->getASTContext().getLazyResolver(),
-                           /*includeInstanceMembers=*/false);
+                           /*includeInstanceMembers=*/false,
+                           /*includeDerivedRequirements*/false,
+                           /*includeProtocolExtensionMembers*/true);
 }
 
 void PrintingTypeContextInfoConsumer::handleResults(
@@ -199,7 +191,7 @@ void PrintingTypeContextInfoConsumer::handleResults(
       OS << "   - ";
 
       OS << "Name: ";
-      VD->getFullName().print(OS);
+      VD->getName().print(OS);
       OS << "\n";
 
       StringRef BriefDoc = VD->getBriefComment();

@@ -18,6 +18,7 @@
 #include "IRGenModule.h"
 #include "SwiftTargetInfo.h"
 
+#include "swift/AST/IRGenOptions.h"
 #include "swift/SIL/SILModule.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Module.h"
@@ -39,9 +40,17 @@ static std::string getCoverageSection(IRGenModule &IGM) {
 
 void IRGenModule::emitCoverageMapping() {
   std::vector<const SILCoverageMap *> Mappings;
-  for (const auto &M : getSILModule().getCoverageMaps())
-    if (M.second->hasSymtabEntry())
-      Mappings.push_back(M.second);
+  for (const auto &M : getSILModule().getCoverageMaps()) {
+    // Check whether this coverage mapping can reference its name data within
+    // the profile symbol table. If the name global is gone, this function has
+    // been optimized out.
+    StringRef PGOFuncName = M.second->getPGOFuncName();
+    std::string PGOFuncNameVar = llvm::getPGOFuncNameVarName(
+        PGOFuncName, llvm::GlobalValue::LinkOnceAnyLinkage);
+    if (!Module.getNamedGlobal(PGOFuncNameVar))
+      continue;
+    Mappings.push_back(M.second);
+  }
 
   // If there aren't any coverage maps, there's nothing to emit.
   if (Mappings.empty())
@@ -52,6 +61,7 @@ void IRGenModule::emitCoverageMapping() {
     if (std::find(Files.begin(), Files.end(), M->getFile()) == Files.end())
       Files.push_back(M->getFile());
 
+  auto remapper = getOptions().CoveragePrefixMap;
   // Awkwardly munge absolute filenames into a vector of StringRefs.
   // TODO: This is heinous - the same thing is happening in clang, but the API
   // really needs to be cleaned up for both.
@@ -60,7 +70,7 @@ void IRGenModule::emitCoverageMapping() {
   for (StringRef Name : Files) {
     llvm::SmallString<256> Path(Name);
     llvm::sys::fs::make_absolute(Path);
-    FilenameStrs.push_back(std::string(Path.begin(), Path.end()));
+    FilenameStrs.push_back(remapper.remapPath(Path));
     FilenameRefs.push_back(FilenameStrs.back());
   }
 
@@ -72,7 +82,7 @@ void IRGenModule::emitCoverageMapping() {
   size_t CurrentSize, PrevSize = FilenamesSize;
 
   // Now we need to build up the list of function records.
-  llvm::LLVMContext &Ctx = LLVMContext;
+  llvm::LLVMContext &Ctx = getLLVMContext();
   auto *Int32Ty = llvm::Type::getInt32Ty(Ctx);
 
   llvm::Type *FunctionRecordTypes[] = {
@@ -106,6 +116,7 @@ void IRGenModule::emitCoverageMapping() {
     StringRef CoverageMapping(OS.str().c_str() + PrevSize, MappingLen);
 
     StringRef NameValue = M->getPGOFuncName();
+    assert(!NameValue.empty() && "Expected a named record");
     uint64_t FuncHash = M->getHash();
 
     // Create a record for this function.
@@ -165,6 +176,6 @@ void IRGenModule::emitCoverageMapping() {
       CovDataVal, llvm::getCoverageMappingVarName());
   std::string CovSection = getCoverageSection(*this);
   CovData->setSection(CovSection);
-  CovData->setAlignment(8);
+  CovData->setAlignment(llvm::MaybeAlign(8));
   addUsedGlobal(CovData);
 }

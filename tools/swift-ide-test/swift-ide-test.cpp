@@ -14,13 +14,15 @@
 #include "ModuleAPIDiff.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTDemangler.h"
+#include "swift/AST/ASTMangler.h"
 #include "swift/AST/ASTPrinter.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/Comment.h"
 #include "swift/AST/DebuggerClient.h"
 #include "swift/AST/DiagnosticConsumer.h"
 #include "swift/AST/DiagnosticEngine.h"
-#include "swift/AST/ASTMangler.h"
+#include "swift/AST/ImportCache.h"
+#include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/PrintOptions.h"
 #include "swift/AST/RawComment.h"
 #include "swift/AST/USRGeneration.h"
@@ -31,6 +33,7 @@
 #include "swift/Driver/FrontendUtil.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
+#include "swift/IDE/CompletionInstance.h"
 #include "swift/IDE/CodeCompletion.h"
 #include "swift/IDE/CommentConversion.h"
 #include "swift/IDE/ConformingMethodList.h"
@@ -43,10 +46,9 @@
 #include "swift/IDE/IDERequests.h"
 #include "swift/Index/Index.h"
 #include "swift/Sema/IDETypeChecking.h"
+#include "swift/SyntaxParse/SyntaxTreeCreator.h"
 #include "swift/Markup/Markup.h"
 #include "swift/Config.h"
-#include "clang/APINotes/APINotesReader.h"
-#include "clang/APINotes/APINotesWriter.h"
 #include "clang/Rewrite/Core/RewriteBuffer.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/Statistic.h"
@@ -56,13 +58,16 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/PrettyStackTrace.h"
 #include "llvm/Support/Process.h"
+#include "llvm/Support/Program.h"
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/ManagedStatic.h"
 #include <system_error>
 
+#include <random>
 #include <string>
+#include <chrono>
 
 using namespace swift;
 using namespace ide;
@@ -72,6 +77,7 @@ namespace {
 
 enum class ActionType {
   None,
+  BatchCodeCompletion,
   CodeCompletion,
   REPLCodeCompletion,
   DumpCompletionCache,
@@ -84,6 +90,7 @@ enum class ActionType {
   PrintASTNotTypeChecked,
   PrintASTTypeChecked,
   PrintModule,
+  PrintModuleMetadata,
   PrintHeader,
   PrintSwiftFileInterface,
   PrintDecl,
@@ -155,6 +162,8 @@ static llvm::cl::opt<ActionType>
 Action(llvm::cl::desc("Mode:"), llvm::cl::init(ActionType::None),
        llvm::cl::cat(Category),
        llvm::cl::values(
+           clEnumValN(ActionType::BatchCodeCompletion,
+                      "batch-code-completion", "Perform code completion in batch mode"),
            clEnumValN(ActionType::CodeCompletion,
                       "code-completion", "Perform code completion"),
            clEnumValN(ActionType::REPLCodeCompletion,
@@ -179,6 +188,8 @@ Action(llvm::cl::desc("Mode:"), llvm::cl::init(ActionType::None),
                       "print-ast-typechecked", "Print the typechecked AST"),
            clEnumValN(ActionType::PrintModule,
                       "print-module", "Print visible declarations in a module"),
+           clEnumValN(ActionType::PrintModuleMetadata,
+                      "print-module-metadata", "Print meta-data in a module"),
            clEnumValN(ActionType::PrintHeader,
                       "print-header", "Print visible declarations in a header file"),
            clEnumValN(ActionType::PrintSwiftFileInterface,
@@ -310,6 +321,12 @@ EnableSourceImport("enable-source-import", llvm::cl::Hidden,
                    llvm::cl::cat(Category), llvm::cl::init(false));
 
 static llvm::cl::opt<bool>
+EnableCrossImportOverlays("enable-cross-import-overlays",
+                          llvm::cl::desc("Automatically import declared cross-import overlays."),
+                          llvm::cl::cat(Category),
+                          llvm::cl::init(false));
+
+static llvm::cl::opt<bool>
 SkipDeinit("skip-deinit",
            llvm::cl::desc("Whether to skip printing destructors"),
            llvm::cl::cat(Category),
@@ -392,6 +409,29 @@ DebugForbidTypecheckPrefix("debug-forbid-typecheck-prefix",
                  "a decl with the provided prefix name"),
   llvm::cl::cat(Category));
 
+// '-batch-code-completion' options.
+
+static llvm::cl::opt<uint64_t>
+RandomSeed("random-seed", llvm::cl::value_desc("seed"),
+                    llvm::cl::desc("Seed for the random number generator"),
+                    llvm::cl::cat(Category),
+                    llvm::cl::init(0));
+
+
+static llvm::cl::opt<std::string>
+CompletionOutputDir("completion-output-dir", llvm::cl::value_desc("path"),
+                    llvm::cl::desc("Directory for completion output"),
+                    llvm::cl::cat(Category));
+
+static llvm::cl::opt<std::string>
+FileCheckPath("filecheck", llvm::cl::value_desc("path"),
+                           llvm::cl::desc("Path to 'FileCheck' utility"),
+                           llvm::cl::cat(Category));
+
+static llvm::cl::opt<bool>
+SkipFileCheck("skip-filecheck", llvm::cl::desc("Skip 'FileCheck' checking"),
+                                llvm::cl::cat(Category));
+
 // '-code-completion' options.
 
 static llvm::cl::opt<std::string>
@@ -417,6 +457,12 @@ CodeCompletionComments("code-completion-comments",
                        llvm::cl::desc("Include comments in code completion results"),
                        llvm::cl::cat(Category),
                        llvm::cl::init(false));
+
+static llvm::cl::opt<bool>
+CodeCOmpletionAnnotateResults("code-completion-annotate-results",
+                              llvm::cl::desc("annotate completion results with XML"),
+                              llvm::cl::cat(Category),
+                              llvm::cl::init(false));
 
 static llvm::cl::opt<std::string>
 DebugClientDiscriminator("debug-client-discriminator",
@@ -686,6 +732,11 @@ static llvm::cl::opt<bool>
                        llvm::cl::desc("Disable ObjC interop."),
                        llvm::cl::cat(Category), llvm::cl::init(false));
 
+static llvm::cl::opt<bool>
+    EnableCxxInterop("enable-cxx-interop",
+                     llvm::cl::desc("Enable C++ interop."),
+                     llvm::cl::cat(Category), llvm::cl::init(false));
+
 static llvm::cl::opt<std::string>
 GraphVisPath("output-request-graphviz",
              llvm::cl::desc("Emit GraphViz output visualizing the request graph."),
@@ -694,6 +745,17 @@ GraphVisPath("output-request-graphviz",
 static llvm::cl::opt<bool>
 CanonicalizeType("canonicalize-type", llvm::cl::Hidden,
                    llvm::cl::cat(Category), llvm::cl::init(false));
+
+static llvm::cl::opt<bool>
+EnableSwiftSourceInfo("enable-swiftsourceinfo",
+                 llvm::cl::desc("Whether to consume .swiftsourceinfo files"),
+                 llvm::cl::cat(Category),
+                 llvm::cl::init(false));
+
+static llvm::cl::opt<std::string>
+ExplicitSwiftModuleMap("explicit-swift-module-map-file",
+                       llvm::cl::desc("JSON file to include explicit Swift modules"),
+                       llvm::cl::cat(Category));
 } // namespace options
 
 static std::unique_ptr<llvm::MemoryBuffer>
@@ -709,23 +771,35 @@ removeCodeCompletionTokens(llvm::MemoryBuffer *Input,
                                            Input->getBufferIdentifier()));
 }
 
-static int doTypeContextInfo(const CompilerInvocation &InitInvok,
-                             StringRef SourceFilename,
-                             StringRef SecondSourceFileName,
-                             StringRef CodeCompletionToken,
-                             bool CodeCompletionDiagnostics) {
+/// Returns true on error
+static bool setBufferForFile(StringRef SourceFilename,
+                             std::unique_ptr<llvm::MemoryBuffer> &Buffer) {
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileBufOrErr =
       llvm::MemoryBuffer::getFile(SourceFilename);
   if (!FileBufOrErr) {
-    llvm::errs() << "error opening input file: "
-                 << FileBufOrErr.getError().message() << '\n';
-    return 1;
+    llvm::errs() << "error opening input file '" << SourceFilename << "':\n"
+                 << "  " << FileBufOrErr.getError().message() << '\n';
+    return true;
   }
+  Buffer = std::move(FileBufOrErr.get());
+  return false;
+}
+
+static bool doCodeCompletionImpl(
+    CodeCompletionCallbacksFactory *callbacksFactory,
+    const CompilerInvocation &InitInvok,
+    StringRef SourceFilename,
+    StringRef SecondSourceFileName,
+    StringRef CodeCompletionToken,
+    bool CodeCompletionDiagnostics) {
+  std::unique_ptr<llvm::MemoryBuffer> FileBuf;
+  if (setBufferForFile(SourceFilename, FileBuf))
+    return 1;
 
   unsigned Offset;
 
   std::unique_ptr<llvm::MemoryBuffer> CleanFile(removeCodeCompletionTokens(
-      FileBufOrErr.get().get(), CodeCompletionToken, &Offset));
+      FileBuf.get(), CodeCompletionToken, &Offset));
 
   if (Offset == ~0U) {
     llvm::errs() << "could not find code completion token \""
@@ -739,8 +813,31 @@ static int doTypeContextInfo(const CompilerInvocation &InitInvok,
 
   CompilerInvocation Invocation(InitInvok);
 
-  Invocation.setCodeCompletionPoint(CleanFile.get(), Offset);
+  if (!SecondSourceFileName.empty()) {
+    Invocation.getFrontendOptions().InputsAndOutputs.addInputFile(
+        SecondSourceFileName);
+  }
 
+  std::string Error;
+  PrintingDiagnosticConsumer PrintDiags;
+  CompletionInstance CompletionInst;
+  auto isSuccess = CompletionInst.performOperation(
+      Invocation, /*Args=*/{}, llvm::vfs::getRealFileSystem(), CleanFile.get(),
+      Offset, /*EnableASTCaching=*/false, Error,
+      CodeCompletionDiagnostics ? &PrintDiags : nullptr,
+      [&](CompilerInstance &CI, bool reusingASTContext) {
+        assert(!reusingASTContext && "reusing AST context without enabling it");
+        auto *SF = CI.getCodeCompletionFile();
+        performCodeCompletionSecondPass(*SF, *callbacksFactory);
+      });
+  return isSuccess ? 0 : 1;
+}
+
+static int doTypeContextInfo(const CompilerInvocation &InitInvok,
+                             StringRef SourceFilename,
+                             StringRef SecondSourceFileName,
+                             StringRef CodeCompletionToken,
+                             bool CodeCompletionDiagnostics) {
   // Create a CodeCompletionConsumer.
   std::unique_ptr<ide::TypeContextInfoConsumer> Consumer(
       new ide::PrintingTypeContextInfoConsumer(llvm::outs()));
@@ -750,23 +847,9 @@ static int doTypeContextInfo(const CompilerInvocation &InitInvok,
   std::unique_ptr<CodeCompletionCallbacksFactory> callbacksFactory(
       ide::makeTypeContextInfoCallbacksFactory(*Consumer));
 
-  Invocation.setCodeCompletionFactory(callbacksFactory.get());
-  if (!SecondSourceFileName.empty()) {
-    Invocation.getFrontendOptions().InputsAndOutputs.addInputFile(
-        SecondSourceFileName);
-  }
-  CompilerInstance CI;
-
-  PrintingDiagnosticConsumer PrintDiags;
-  if (CodeCompletionDiagnostics) {
-    // Display diagnostics to stderr.
-    CI.addDiagnosticConsumer(&PrintDiags);
-  }
-  if (CI.setup(Invocation))
-    return 1;
-  registerIDERequestFunctions(CI.getASTContext().evaluator);
-  CI.performSema();
-  return 0;
+  return doCodeCompletionImpl(callbacksFactory.get(), InitInvok, SourceFilename,
+                              SecondSourceFileName, CodeCompletionToken,
+                              CodeCompletionDiagnostics);
 }
 
 static int
@@ -775,33 +858,6 @@ doConformingMethodList(const CompilerInvocation &InitInvok,
                        StringRef CodeCompletionToken,
                        bool CodeCompletionDiagnostics,
                        const std::vector<std::string> expectedTypeNames) {
-  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileBufOrErr =
-      llvm::MemoryBuffer::getFile(SourceFilename);
-  if (!FileBufOrErr) {
-    llvm::errs() << "error opening input file: "
-                 << FileBufOrErr.getError().message() << '\n';
-    return 1;
-  }
-
-  unsigned Offset;
-
-  std::unique_ptr<llvm::MemoryBuffer> CleanFile(removeCodeCompletionTokens(
-      FileBufOrErr.get().get(), CodeCompletionToken, &Offset));
-
-  if (Offset == ~0U) {
-    llvm::errs() << "could not find code completion token \""
-                 << CodeCompletionToken << "\"\n";
-    return 1;
-  }
-  llvm::outs() << "found code completion token " << CodeCompletionToken
-               << " at offset " << Offset << "\n";
-  llvm::errs() << "found code completion token " << CodeCompletionToken
-               << " at offset " << Offset << "\n";
-
-  CompilerInvocation Invocation(InitInvok);
-
-  Invocation.setCodeCompletionPoint(CleanFile.get(), Offset);
-
   SmallVector<const char *, 4> typeNames;
   for (auto &name : expectedTypeNames)
     typeNames.push_back(name.c_str());
@@ -815,23 +871,9 @@ doConformingMethodList(const CompilerInvocation &InitInvok,
   std::unique_ptr<CodeCompletionCallbacksFactory> callbacksFactory(
       ide::makeConformingMethodListCallbacksFactory(typeNames, *Consumer));
 
-  Invocation.setCodeCompletionFactory(callbacksFactory.get());
-  if (!SecondSourceFileName.empty()) {
-    Invocation.getFrontendOptions().InputsAndOutputs.addInputFile(
-        SecondSourceFileName);
-  }
-  CompilerInstance CI;
-
-  PrintingDiagnosticConsumer PrintDiags;
-  if (CodeCompletionDiagnostics) {
-    // Display diagnostics to stderr.
-    CI.addDiagnosticConsumer(&PrintDiags);
-  }
-  if (CI.setup(Invocation))
-    return 1;
-  registerIDERequestFunctions(CI.getASTContext().evaluator);
-  CI.performSema();
-  return 0;
+  return doCodeCompletionImpl(callbacksFactory.get(), InitInvok, SourceFilename,
+                              SecondSourceFileName, CodeCompletionToken,
+                              CodeCompletionDiagnostics);
 }
 
 static int doCodeCompletion(const CompilerInvocation &InitInvok,
@@ -840,91 +882,442 @@ static int doCodeCompletion(const CompilerInvocation &InitInvok,
                             StringRef CodeCompletionToken,
                             bool CodeCompletionDiagnostics,
                             bool CodeCompletionKeywords,
-                            bool CodeCompletionComments) {
-  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileBufOrErr =
-    llvm::MemoryBuffer::getFile(SourceFilename);
-  if (!FileBufOrErr) {
-    llvm::errs() << "error opening input file: "
-                 << FileBufOrErr.getError().message() << '\n';
-    return 1;
-  }
-
-  unsigned CodeCompletionOffset;
-
-  std::unique_ptr<llvm::MemoryBuffer> CleanFile(
-      removeCodeCompletionTokens(FileBufOrErr.get().get(), CodeCompletionToken,
-                                 &CodeCompletionOffset));
-
-  if (CodeCompletionOffset == ~0U) {
-    llvm::errs() << "could not find code completion token \""
-                 << CodeCompletionToken << "\"\n";
-    return 1;
-  }
-  llvm::outs() << "found code completion token " << CodeCompletionToken
-               << " at offset " << CodeCompletionOffset << "\n";
-  llvm::errs() << "found code completion token " << CodeCompletionToken
-               << " at offset " << CodeCompletionOffset << "\n";
-
-  CompilerInvocation Invocation(InitInvok);
-
-  Invocation.setCodeCompletionPoint(CleanFile.get(), CodeCompletionOffset);
-
-
+                            bool CodeCompletionComments,
+                            bool CodeCompletionAnnotateResults) {
   std::unique_ptr<ide::OnDiskCodeCompletionCache> OnDiskCache;
   if (!options::CompletionCachePath.empty()) {
-    OnDiskCache = llvm::make_unique<ide::OnDiskCodeCompletionCache>(
+    OnDiskCache = std::make_unique<ide::OnDiskCodeCompletionCache>(
         options::CompletionCachePath);
   }
   ide::CodeCompletionCache CompletionCache(OnDiskCache.get());
   ide::CodeCompletionContext CompletionContext(CompletionCache);
+  CompletionContext.setAnnotateResult(CodeCompletionAnnotateResults);
 
   // Create a CodeCompletionConsumer.
   std::unique_ptr<ide::CodeCompletionConsumer> Consumer(
       new ide::PrintingCodeCompletionConsumer(
-          llvm::outs(), CodeCompletionKeywords, CodeCompletionComments));
+          llvm::outs(), CodeCompletionKeywords, CodeCompletionComments,
+          CodeCompletionAnnotateResults));
 
   // Create a factory for code completion callbacks that will feed the
   // Consumer.
-  std::unique_ptr<CodeCompletionCallbacksFactory> CompletionCallbacksFactory(
-      ide::makeCodeCompletionCallbacksFactory(CompletionContext,
-                                              *Consumer));
+  std::unique_ptr<CodeCompletionCallbacksFactory> callbacksFactory(
+      ide::makeCodeCompletionCallbacksFactory(CompletionContext, *Consumer));
 
-  Invocation.setCodeCompletionFactory(CompletionCallbacksFactory.get());
-  if (!SecondSourceFileName.empty()) {
-    Invocation.getFrontendOptions().InputsAndOutputs.addInputFile(
-        SecondSourceFileName);
-  }
-  CompilerInstance CI;
-
-  PrintingDiagnosticConsumer PrintDiags;
-  if (CodeCompletionDiagnostics) {
-    // Display diagnostics to stderr.
-    CI.addDiagnosticConsumer(&PrintDiags);
-  }
-  if (CI.setup(Invocation))
-    return 1;
-  registerIDERequestFunctions(CI.getASTContext().evaluator);
-  CI.performSema();
-  return 0;
+  return doCodeCompletionImpl(callbacksFactory.get(), InitInvok, SourceFilename,
+                              SecondSourceFileName, CodeCompletionToken,
+                              CodeCompletionDiagnostics);
 }
 
-static int doREPLCodeCompletion(const CompilerInvocation &InitInvok,
-                                StringRef SourceFilename) {
-  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileBufOrErr =
-    llvm::MemoryBuffer::getFile(SourceFilename);
+namespace {
+struct CompletionTestToken {
+  unsigned Line;
+  unsigned Column;
+  unsigned Offset;
+  StringRef Name;
+  SmallVector<StringRef, 1> CheckPrefixes;
+  StringRef Skip;
+  Optional<bool> IncludeKeywords = None;
+  Optional<bool> IncludeComments = None;
+
+  CompletionTestToken(unsigned Line, unsigned Column, unsigned Offset)
+      : Line(Line), Column(Column), Offset(Offset){};
+
+  static bool isStartOfToken(const char *Ptr) {
+    return Ptr[0] == '#' && Ptr[1] == '^';
+  }
+
+  static bool isEndOfToken(const char *Ptr) {
+    return Ptr[0] == '^' && Ptr[1] == '#';
+  }
+
+  static bool isValidTokenChar(char Chr) {
+    return (Chr >= 'A' && Chr <= 'Z') || (Chr >= 'a' && Chr <= 'z') ||
+           (Chr >= '0' && Chr <= '9') || Chr == '_' || Chr == '-' || Chr == '.';
+  }
+
+  static bool parseBooleanValue(StringRef Value, bool &Result,
+                                std::string &Error) {
+    if (Value.empty() || Value == "true" || Value == "1") {
+      Result = true;
+      return false;
+    }
+    if (Value == "false" || Value == "0") {
+      Result = false;
+      return false;
+    }
+
+    Error = "invalid value for keywords";
+    return true;
+  }
+
+  // #^TOKEN_NAME?check-prefix=CHECK1,CHECK2&keywords=1&comments=true^#
+  static bool parse(const char *&InputPtr, CompletionTestToken &Result,
+                    std::string &Error) {
+    auto Ptr = InputPtr;
+    assert(isStartOfToken(Ptr));
+    Ptr += 2;
+
+    // Parse the token name.
+    auto NameStart = Ptr;
+    while (isValidTokenChar(*Ptr)) { ++Ptr; }
+    Result.Name = StringRef(NameStart, Ptr - NameStart);
+
+    // Parse optional query string.
+    if (*Ptr == '?') {
+      ++Ptr;
+      auto QueryStart = Ptr;
+      while (!isEndOfToken(Ptr) && *Ptr != 0 && *Ptr != '\n' && *Ptr != '\r')
+        ++Ptr;
+      StringRef QueryString(QueryStart, Ptr - QueryStart);
+
+      while (!QueryString.empty()) {
+        StringRef Query, Key, Value;
+        std::tie(Query, QueryString) = QueryString.split(';');
+        std::tie(Key, Value) = Query.split('=');
+
+        if (Key == "check") {
+          // This value is passed to 'FileCheck --check-prefixes' as is.
+          Result.CheckPrefixes.push_back(Value);
+          continue;
+        }
+        if (Key == "keywords") {
+          Result.IncludeKeywords.emplace();
+          if (parseBooleanValue(Value, *Result.IncludeKeywords, Error))
+            return true;
+          continue;
+        }
+        if (Key == "comments") {
+          Result.IncludeComments.emplace();
+          if (parseBooleanValue(Value, *Result.IncludeComments, Error))
+            return true;
+          continue;
+        }
+        if (Key == "skip") {
+          Result.Skip = Value;
+          continue;
+        }
+        Error = "unknown option (" + Key.str() + ") for token";
+        return true;
+      }
+    }
+
+    // Default check prefix is the token name.
+    if (Result.CheckPrefixes.empty())
+      Result.CheckPrefixes.push_back(Result.Name);
+
+    // Tokens must end with '^#'.
+    if (!isEndOfToken(Ptr)) {
+      Error = "expected '^#' at the end of completion token";
+      return true;
+    }
+
+    InputPtr = Ptr + 2;
+    return false;;
+  }
+};
+
+static std::unique_ptr<llvm::MemoryBuffer>
+removeCodeCompletionTokens(llvm::MemoryBuffer *Input,
+                           SmallVectorImpl<CompletionTestToken> &Tokens,
+                           std::string &Error) {
+  const char *Start = Input->getBufferStart();
+  const char *End = Input->getBufferEnd();
+  assert(*End == 0 && "buffer must be nul terminated");
+
+  std::string Out;
+  Out.reserve(Input->getBufferSize());
+
+  llvm::StringSet<> seenTokenName;
+  const char *Ptr = Start;
+  const char *SegmentStart = Ptr;
+  unsigned Removed = 0;
+  unsigned Line = 1;
+  unsigned Column = 1;
+  while (Ptr != End) {
+    if (CompletionTestToken::isStartOfToken(Ptr)) {
+      Out.append(SegmentStart, Ptr - SegmentStart);
+
+      // Emplace a token with the offset, and parse it.
+      const char *TokenStart = Ptr;
+      Tokens.emplace_back(Line, Column, Ptr - Start - Removed);
+      if (CompletionTestToken::parse(Ptr, Tokens.back(), Error)) {
+        Error = "while parsing a token at " +
+                (llvm::utostr(Line) + ":" + llvm::utostr(Column)) + ": " +
+                Error;
+        return nullptr;
+      }
+
+      if (!seenTokenName.insert(Tokens.back().Name).second) {
+        Error = "Duplicated token name '" + Tokens.back().Name.str() +
+                "' at " + (llvm::utostr(Line) + ":" + llvm::utostr(Column));
+        return nullptr;
+      }
+
+      auto TokLen =  Ptr - TokenStart;
+      SegmentStart = Ptr;
+      Removed += TokLen;
+      Column += TokLen;
+      continue;
+    }
+    if (*Ptr == '\r' || *Ptr == '\n') {
+      Ptr += (Ptr[0] == '\r' && Ptr[1] == '\n') ? 2 : 1;
+      Line += 1;
+      Column = 1;
+      continue;
+    }
+    ++Ptr;
+    ++Column;
+  }
+  Out.append(SegmentStart, Ptr - SegmentStart);
+
+  return llvm::MemoryBuffer::getMemBufferCopy(Out,
+                                              Input->getBufferIdentifier());
+}
+
+} // namespace
+
+static int doBatchCodeCompletion(const CompilerInvocation &InitInvok,
+                                 StringRef SourceFilename,
+                                 bool CodeCompletionDiagnostics,
+                                 bool CodeCompletionKeywords,
+                                 bool CodeCompletionComments) {
+  auto FileBufOrErr = llvm::MemoryBuffer::getFile(SourceFilename);
   if (!FileBufOrErr) {
     llvm::errs() << "error opening input file: "
                  << FileBufOrErr.getError().message() << '\n';
     return 1;
   }
 
-  StringRef BufferText = FileBufOrErr.get()->getBuffer();
+  // Completion results are output to
+  // '${OutputDir}/complete-{Token.Name}.result'.
+  SmallString<128> OutputDir;
+  if (!options::CompletionOutputDir.empty()) {
+    OutputDir = options::CompletionOutputDir;
+    if (auto result = llvm::sys::fs::create_directories(OutputDir))
+      return result.value();
+  } else if (!options::SkipFileCheck) {
+    llvm::errs() << "error: -completion-output-dir is needed unless "
+                    "-skip-filecheck is specified.\n";
+    return 1;
+  }
+
+  std::string Error;
+
+  llvm::SmallVector<CompletionTestToken, 0> CCTokens;
+  auto CleanFile =
+      removeCodeCompletionTokens(FileBufOrErr.get().get(), CCTokens, Error);
+  if (!CleanFile) {
+    llvm::errs() << "error: " << Error << "\n";
+    return 1;
+  }
+
+  if (!options::CodeCompletionToken.empty()) {
+    // If `-code-completion-token` is specified, test only that token.
+    // TODO: Multiple tokens.
+    StringRef TargetTokName = options::CodeCompletionToken;
+    Optional<CompletionTestToken> FoundTok;
+    for (auto Tok : CCTokens) {
+      if (Tok.Name == TargetTokName) {
+        FoundTok = Tok;
+        break;
+      }
+    }
+    if (FoundTok) {
+      CCTokens = {*FoundTok};
+    } else {
+      llvm::errs() << "error: could not find code completion token \""
+                   << TargetTokName << "\"\n";
+      return 1;
+    }
+  } else {
+    // Shuffle tokens to detect order-dependent bugs.
+    if (CCTokens.empty()) {
+      llvm::errs()
+          << "error: could not find any code completion tokens in input file\n";
+      return 1;
+    }
+    unsigned RandomSeed = options::RandomSeed;
+    if (RandomSeed == 0)
+      RandomSeed = std::chrono::system_clock::now().time_since_epoch().count();
+    llvm::errs() << "Use --random-seed=" << RandomSeed
+                 << " to reproduce the order of this run.\n";
+
+    std::shuffle(CCTokens.begin(), CCTokens.end(),
+                 std::default_random_engine(RandomSeed));
+  }
+
+  CompilerInvocation Invocation(InitInvok);
+  auto FileSystem = llvm::vfs::getRealFileSystem();
+
+  CompletionInstance CompletionInst;
+
+  std::unique_ptr<ide::OnDiskCodeCompletionCache> OnDiskCache;
+  if (!options::CompletionCachePath.empty())
+    OnDiskCache = std::make_unique<ide::OnDiskCodeCompletionCache>(
+        options::CompletionCachePath);
+  ide::CodeCompletionCache CompletionCache(OnDiskCache.get());
+
+  // Process tokens.
+  SmallVector<StringRef, 0> FailedTokens;
+  for (const auto &Token : CCTokens) {
+    if (!options::CodeCompletionToken.empty() &&
+        options::CodeCompletionToken != Token.Name)
+      continue;
+
+    llvm::errs() << "----\n";
+    llvm::errs() << "Token: " << Token.Name << "; offset=" << Token.Offset
+                 << "; pos=" << Token.Line << ":" << Token.Column;
+    for (auto Prefix : Token.CheckPrefixes) {
+      llvm::errs() << "; check=" << Prefix;
+    }
+    llvm::errs() << "\n";
+
+    // Skip tokens with '?skip=${reason}'.
+    if (!Token.Skip.empty()) {
+      llvm::errs() << "Skipped: " << Token.Skip << "\n";
+      continue;
+    }
+
+    auto IncludeKeywords = CodeCompletionKeywords;
+    if (Token.IncludeKeywords)
+      IncludeKeywords = *Token.IncludeKeywords;
+
+    auto IncludeComments = CodeCompletionComments;
+    if (Token.IncludeComments)
+      IncludeComments = *Token.IncludeComments;
+
+    // Store the result to a string.
+    std::string ResultStr;
+    llvm::raw_string_ostream OS(ResultStr);
+    OS << "// Token: "  << Token.Name << "\n";
+
+    auto Offset = Token.Offset;
+    auto completionBuffer = ide::makeCodeCompletionMemoryBuffer(
+        CleanFile.get(), Offset, CleanFile->getBufferIdentifier());
+
+    PrintingDiagnosticConsumer PrintDiags;
+    auto completionStart = std::chrono::high_resolution_clock::now();
+    bool wasASTContextReused = false;
+    bool isSuccess = CompletionInst.performOperation(
+        Invocation, /*Args=*/{}, FileSystem, completionBuffer.get(), Offset,
+        /*EnableASTCaching=*/true, Error,
+        CodeCompletionDiagnostics ? &PrintDiags : nullptr,
+        [&](CompilerInstance &CI, bool reusingASTContext) {
+          // Create a CodeCompletionConsumer.
+          std::unique_ptr<ide::CodeCompletionConsumer> Consumer(
+              new ide::PrintingCodeCompletionConsumer(OS, IncludeKeywords,
+                                                      IncludeComments));
+
+          // Create a factory for code completion callbacks that will feed the
+          // Consumer.
+          ide::CodeCompletionContext CompletionContext(CompletionCache);
+          std::unique_ptr<CodeCompletionCallbacksFactory> callbacksFactory(
+              ide::makeCodeCompletionCallbacksFactory(CompletionContext,
+                                                      *Consumer));
+
+          auto *SF = CI.getCodeCompletionFile();
+          performCodeCompletionSecondPass(*SF, *callbacksFactory);
+          wasASTContextReused = reusingASTContext;
+        });
+    auto completionEnd = std::chrono::high_resolution_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        completionEnd - completionStart);
+    llvm::errs() << "Elapsed: " << elapsed.count() << " msec";
+    if (wasASTContextReused)
+      llvm::errs() << " (reusing ASTContext)";
+    llvm::errs() << "\n";
+    OS.flush();
+
+    if (OutputDir.empty()) {
+      // If output directory is not specified, print the results to STDOUT.
+      llvm::outs() << ResultStr;
+      continue;
+    }
+
+    // Print to '${OutputDir}/complete-{Token.Name}.result'.
+    int resultFD;
+    SmallString<128> resultFilename(OutputDir);
+    llvm::sys::path::append(resultFilename,
+                            "complete-" + Token.Name + ".result");
+    if (auto res = llvm::sys::fs::openFileForWrite(resultFilename, resultFD)) {
+      llvm::errs() << "error: failed to create output file: "
+                   << resultFilename << "\n";
+      return res.value();
+    }
+
+    llvm::raw_fd_ostream fileOut(resultFD, /*shouldClose=*/true);
+    fileOut << ResultStr;
+    fileOut.close();
+
+    if (!isSuccess) {
+      llvm::errs() << "error: " << Error << "\n";
+      return 1;
+    }
+
+    if (options::SkipFileCheck)
+      continue;
+
+    assert(!options::FileCheckPath.empty());
+
+    bool isFileCheckFailed = false;
+    for (auto Prefix : Token.CheckPrefixes) {
+      StringRef FileCheckArgs[] = {options::FileCheckPath, SourceFilename,
+                                   "--check-prefixes",     Prefix,
+                                   "--input-file",         resultFilename};
+
+      int result =
+          llvm::sys::ExecuteAndWait(options::FileCheckPath, FileCheckArgs,
+                                    /*Env=*/None,
+                                    /*Redirects=*/{},
+                                    /*SecondsToWait=*/0,
+                                    /*MemoryLimit=*/0,
+                                    /*ErrMsg=*/&Error);
+      if (result != 0) {
+        isFileCheckFailed = true;
+        if (!Error.empty())
+          llvm::errs() << "error: " << Error << "\n";
+
+        // Output the FileCheck invocation.
+        llvm::errs() << "+";
+        for (auto arg : FileCheckArgs)
+          llvm::errs() << " " << arg;
+        llvm::errs() << "\n";
+      }
+    }
+
+    if (isFileCheckFailed) {
+      FailedTokens.push_back(Token.Name);
+    } else {
+      // The result may be huge. Remove the result if it's succeeded.
+      llvm::sys::fs::remove(resultFilename);
+    }
+  }
+
+  if (!FailedTokens.empty()) {
+    llvm::errs() << "----\n";
+    llvm::errs() << "Unexpected failures: ";
+    llvm::interleave(
+        FailedTokens, [&](StringRef name) { llvm::errs() << name; },
+        [&]() { llvm::errs() << ", "; });
+  }
+
+  return !FailedTokens.empty();
+}
+
+static int doREPLCodeCompletion(const CompilerInvocation &InitInvok,
+                                StringRef SourceFilename) {
+  std::unique_ptr<llvm::MemoryBuffer> FileBuf;
+  if (setBufferForFile(SourceFilename, FileBuf))
+    return 1;
+
+  StringRef BufferText = FileBuf->getBuffer();
   // Drop a single newline character from the buffer.
   if (BufferText.endswith("\n"))
     BufferText = BufferText.drop_back(1);
 
   CompilerInvocation Invocation(InitInvok);
-  Invocation.setInputKind(InputFileKind::SwiftREPL);
+  Invocation.setInputKind(InputFileKind::Swift);
 
   CompilerInstance CI;
 
@@ -933,13 +1326,21 @@ static int doREPLCodeCompletion(const CompilerInvocation &InitInvok,
   CI.addDiagnosticConsumer(&PrintDiags);
   if (CI.setup(Invocation))
     return 1;
-  registerIDERequestFunctions(CI.getASTContext().evaluator);
-  CI.performSema();
+  auto &ctx = CI.getASTContext();
+  registerIDERequestFunctions(ctx.evaluator);
 
-  SourceFile &SF = CI.getMainModule()->getMainSourceFile(SourceFileKind::REPL);
+  // Create an initial empty SourceFile. This only exists to feed in the
+  // implicit stdlib import.
+  ImplicitImportInfo importInfo;
+  importInfo.StdlibKind = ImplicitStdlibKind::Stdlib;
+  auto *M = ModuleDecl::create(ctx.getIdentifier(Invocation.getModuleName()),
+                               ctx, importInfo);
+  auto *SF = new (ctx) SourceFile(*M, SourceFileKind::Main, /*BufferID*/ None);
+  M->addFile(*SF);
+  performImportResolution(*SF);
 
   REPLCompletions REPLCompl;
-  REPLCompl.populate(SF, BufferText);
+  REPLCompl.populate(*SF, BufferText);
   llvm::outs() << "Begin completions\n";
   for (StringRef S : REPLCompl.getCompletionList()) {
     llvm::outs() << S << "\n";
@@ -1100,8 +1501,8 @@ public:
     }
 
     if (Begin) {
-      if (const char *CStr =
-          llvm::sys::Process::OutputColor(Col, false, false)) {
+      if (const char *CStr = llvm::sys::Process::OutputColor(
+              static_cast<char>(Col), false, false)) {
         OS << CStr;
       }
     } else {
@@ -1124,38 +1525,72 @@ static int doSyntaxColoring(const CompilerInvocation &InitInvok,
   CompilerInvocation Invocation(InitInvok);
   Invocation.getFrontendOptions().InputsAndOutputs.addInputFile(SourceFilename);
   Invocation.getLangOptions().DisableAvailabilityChecking = false;
-
-  CompilerInstance CI;
-
-  // Display diagnostics to stderr.
-  PrintingDiagnosticConsumer PrintDiags;
-  CI.addDiagnosticConsumer(&PrintDiags);
   Invocation.getLangOptions().Playground = Playground;
   Invocation.getLangOptions().CollectParsedToken = true;
   Invocation.getLangOptions().BuildSyntaxTree = true;
-  if (CI.setup(Invocation))
-    return 1;
-  registerIDERequestFunctions(CI.getASTContext().evaluator);
-  if (!RunTypeChecker)
-    CI.performParseOnly();
-  else
+
+  // Display diagnostics to stderr.
+  PrintingDiagnosticConsumer PrintDiags;
+
+  if (RunTypeChecker) {
+    CompilerInstance CI;
+    CI.addDiagnosticConsumer(&PrintDiags);
+    if (CI.setup(Invocation))
+      return 1;
     CI.performSema();
 
-  unsigned BufID = CI.getInputBufferIDs().back();
-  SourceFile *SF = nullptr;
-  for (auto Unit : CI.getMainModule()->getFiles()) {
-    SF = dyn_cast<SourceFile>(Unit);
-    if (SF)
-      break;
+    unsigned BufID = CI.getInputBufferIDs().back();
+    SourceFile *SF = nullptr;
+    for (auto Unit : CI.getMainModule()->getFiles()) {
+      SF = dyn_cast<SourceFile>(Unit);
+      if (SF)
+        break;
+    }
+    assert(SF && "no source file?");
+
+    ide::SyntaxModelContext ColorContext(*SF);
+    PrintSyntaxColorWalker ColorWalker(CI.getSourceMgr(), BufID, llvm::outs(),
+                                       TerminalOutput);
+    ColorContext.walk(ColorWalker);
+    ColorWalker.finished();
+  } else {
+    // SourceKit doesn't set up a compiler instance at all for its syntactic
+    // requests, just the parser. We try to mimic that setup here to help catch
+    // any cases where the walker might inadvertently rely on the name lookup or
+    // other semantic functionality via the request evaluator.
+    std::unique_ptr<llvm::MemoryBuffer> FileBuf;
+    if (setBufferForFile(SourceFilename, FileBuf))
+      return 1;
+
+    SourceManager SM;
+    unsigned BufferID = SM.addNewSourceBuffer(std::move(FileBuf));
+
+    RC<SyntaxArena> syntaxArena{new syntax::SyntaxArena()};
+    std::shared_ptr<SyntaxTreeCreator> SynTreeCreator =
+        std::make_shared<SyntaxTreeCreator>(
+            SM, BufferID, Invocation.getMainFileSyntaxParsingCache(),
+            syntaxArena);
+
+    ParserUnit Parser(SM, SourceFileKind::Main, BufferID,
+                      Invocation.getLangOptions(),
+                      Invocation.getTypeCheckerOptions(),
+                      Invocation.getModuleName(),
+                      SynTreeCreator,
+                      Invocation.getMainFileSyntaxParsingCache());
+
+    registerParseRequestFunctions(Parser.getParser().Context.evaluator);
+    registerTypeCheckerRequestFunctions(Parser.getParser().Context.evaluator);
+
+    Parser.getDiagnosticEngine().addConsumer(PrintDiags);
+
+    (void)Parser.parse();
+
+    ide::SyntaxModelContext ColorContext(Parser.getSourceFile());
+    PrintSyntaxColorWalker ColorWalker(SM, BufferID, llvm::outs(),
+                                       TerminalOutput);
+    ColorContext.walk(ColorWalker);
+    ColorWalker.finished();
   }
-  assert(SF && "no source file?");
-
-  ide::SyntaxModelContext ColorContext(*SF);
-  PrintSyntaxColorWalker ColorWalker(CI.getSourceMgr(), BufID, llvm::outs(),
-                                     TerminalOutput);
-  ColorContext.walk(ColorWalker);
-  ColorWalker.finished();
-
   return 0;
 }
 
@@ -1347,25 +1782,48 @@ private:
 
 static int doStructureAnnotation(const CompilerInvocation &InitInvok,
                                  StringRef SourceFilename) {
+  std::unique_ptr<llvm::MemoryBuffer> FileBuf;
+  if (setBufferForFile(SourceFilename, FileBuf))
+    return 1;
+
   CompilerInvocation Invocation(InitInvok);
   Invocation.getLangOptions().BuildSyntaxTree = true;
   Invocation.getLangOptions().CollectParsedToken = true;
   Invocation.getFrontendOptions().InputsAndOutputs.addInputFile(SourceFilename);
 
-  CompilerInstance CI;
+  // Structure annotation is run as a purely syntactic request by SourceKit. It
+  // doesn't set up a compiler instance at all, just the parser. We try to mimic
+  // that setup here to help catch any cases where the walker might inadvertently
+  // rely on the name lookup or other semantic functionality via the request
+  // evaluator.
+  SourceManager SM;
+  unsigned BufferID = SM.addNewSourceBuffer(std::move(FileBuf));
+
+  RC<SyntaxArena> syntaxArena{new syntax::SyntaxArena()};
+  std::shared_ptr<SyntaxTreeCreator> SynTreeCreator =
+      std::make_shared<SyntaxTreeCreator>(
+          SM, BufferID, Invocation.getMainFileSyntaxParsingCache(),
+          syntaxArena);
+
+  ParserUnit Parser(SM, SourceFileKind::Main, BufferID,
+                    Invocation.getLangOptions(),
+                    Invocation.getTypeCheckerOptions(),
+                    Invocation.getModuleName(),
+                    SynTreeCreator,
+                    Invocation.getMainFileSyntaxParsingCache());
+
+  registerParseRequestFunctions(Parser.getParser().Context.evaluator);
+  registerTypeCheckerRequestFunctions(
+      Parser.getParser().Context.evaluator);
 
   // Display diagnostics to stderr.
   PrintingDiagnosticConsumer PrintDiags;
-  CI.addDiagnosticConsumer(&PrintDiags);
-  if (CI.setup(Invocation))
-    return 1;
-  registerIDERequestFunctions(CI.getASTContext().evaluator);
-  CI.performParseOnly();
+  Parser.getDiagnosticEngine().addConsumer(PrintDiags);
 
-  unsigned BufID = CI.getInputBufferIDs().back();
-  ide::SyntaxModelContext StructureContext(
-      CI.getMainModule()->getMainSourceFile(SourceFileKind::Main));
-  StructureAnnotator Annotator(CI.getSourceMgr(), BufID);
+  (void)Parser.parse();
+
+  ide::SyntaxModelContext StructureContext(Parser.getSourceFile());
+  StructureAnnotator Annotator(SM, BufferID);
   StructureContext.walk(Annotator);
   Annotator.printResult(llvm::outs());
   return 0;
@@ -1502,8 +1960,8 @@ private:
 
   void printLoc(SourceLoc Loc, raw_ostream &OS) {
     OS << '@';
-    if (Loc.isValid()) {
-      auto LineCol = SM.getLineAndColumn(Loc, BufferID);
+    if (Loc.isValid() && SM.findBufferContainingLoc(Loc) == BufferID) {
+      auto LineCol = SM.getPresumedLineAndColumnForLoc(Loc, BufferID);
       OS  << LineCol.first << ':' << LineCol.second;
     }
   }
@@ -1519,16 +1977,16 @@ private:
         OS << 'i';
       if (isa<ConstructorDecl>(D) && Entity.IsRef) {
         OS << "Ctor";
-        printLoc(D->getLoc(), OS);
+        printLoc(D->getLoc(/*SerializedOK*/false), OS);
         if (Entity.CtorTyRef) {
           OS << '-';
           OS << Decl::getKindName(Entity.CtorTyRef->getKind());
-          printLoc(Entity.CtorTyRef->getLoc(), OS);
+          printLoc(Entity.CtorTyRef->getLoc(/*SerializedOK*/false), OS);
         }
       } else {
         OS << Decl::getKindName(D->getKind());
         if (Entity.IsRef)
-          printLoc(D->getLoc(), OS);
+          printLoc(D->getLoc(/*SerializedOK*/false), OS);
       }
 
     } else {
@@ -1591,8 +2049,8 @@ private:
       Col = llvm::raw_ostream::CYAN; break;
     }
 
-    if (const char *CStr =
-        llvm::sys::Process::OutputColor(Col, false, false)) {
+    if (const char *CStr = llvm::sys::Process::OutputColor(
+            static_cast<char>(Col), false, false)) {
       OS << CStr;
     }
     OS << Text;
@@ -1628,18 +2086,14 @@ static int doSemanticAnnotation(const CompilerInvocation &InitInvok,
 }
 
 static int doInputCompletenessTest(StringRef SourceFilename) {
-  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileBufOrErr =
-    llvm::MemoryBuffer::getFile(SourceFilename);
-  if (!FileBufOrErr) {
-    llvm::errs() << "error opening input file: "
-                 << FileBufOrErr.getError().message() << '\n';
+  std::unique_ptr<llvm::MemoryBuffer> FileBuf;
+  if (setBufferForFile(SourceFilename, FileBuf))
     return 1;
-  }
 
   llvm::raw_ostream &OS = llvm::outs();
   OS << SourceFilename << ": ";
-  if (isSourceInputComplete(std::move(FileBufOrErr.get()),
-                            SourceFileKind::REPL).IsComplete) {
+  if (isSourceInputComplete(std::move(FileBuf),
+                            SourceFileKind::Main).IsComplete) {
     OS << "IS_COMPLETE\n";
   } else {
     OS << "IS_INCOMPLETE\n";
@@ -1652,7 +2106,7 @@ static int doInputCompletenessTest(StringRef SourceFilename) {
 //===----------------------------------------------------------------------===//
 
 static ModuleDecl *getModuleByFullName(ASTContext &Context, StringRef ModuleName) {
-  SmallVector<std::pair<Identifier, SourceLoc>, 4>
+  SmallVector<Located<Identifier>, 4>
       AccessPath;
   while (!ModuleName.empty()) {
     StringRef SubModuleName;
@@ -1667,8 +2121,7 @@ static ModuleDecl *getModuleByFullName(ASTContext &Context, StringRef ModuleName
 }
 
 static ModuleDecl *getModuleByFullName(ASTContext &Context, Identifier ModuleName) {
-  ModuleDecl *Result = Context.getModule(std::make_pair(ModuleName,
-                                                        SourceLoc()));
+  ModuleDecl *Result = Context.getModule({ Located<Identifier>(ModuleName,SourceLoc()) });
   if (!Result || Result->failedToLoad())
     return nullptr;
   return Result;
@@ -1682,6 +2135,9 @@ static int doPrintAST(const CompilerInvocation &InitInvok,
                       StringRef DebugClientDiscriminator) {
   CompilerInvocation Invocation(InitInvok);
   Invocation.getFrontendOptions().InputsAndOutputs.addInputFile(SourceFilename);
+
+  if (!RunTypeChecker)
+    Invocation.getLangOptions().DisablePoundIfEvaluation = true;
 
   CompilerInstance CI;
 
@@ -1700,9 +2156,7 @@ static int doPrintAST(const CompilerInvocation &InitInvok,
     CI.getMainModule()->setDebugClient(DebuggerClient.get());
   }
 
-  if (!RunTypeChecker)
-    CI.performParseOnly();
-  else
+  if (RunTypeChecker)
     CI.performSema();
 
   if (MangledNameToFind.empty()) {
@@ -1957,9 +2411,11 @@ public:
     OS << "</synthesized>";
   }
 
-  void printTypeRef(Type T, const TypeDecl *TD, Identifier Name) override {
+  void printTypeRef(
+      Type T, const TypeDecl *TD, Identifier Name,
+      PrintNameContext NameContext = PrintNameContext::Normal) override {
     OS << "<ref:" << Decl::getKindName(TD->getKind()) << '>';
-    StreamPrinter::printTypeRef(T, TD, Name);
+    StreamPrinter::printTypeRef(T, TD, Name, NameContext);
     OS << "</ref>";
   }
   void printModuleRef(ModuleEntity Mod, Identifier Name) override {
@@ -2038,6 +2494,76 @@ static int doPrintModuleGroups(const CompilerInvocation &InitInvok,
   return ExitCode;
 }
 
+static void printModuleMetadata(ModuleDecl *MD) {
+  auto &OS = llvm::outs();
+  MD->collectLinkLibraries([&](LinkLibrary lib) {
+    OS << "link library: " << lib.getName()
+       << ", force load: " << (lib.shouldForceLoad() ? "true" : "false") << "\n";
+  });
+}
+
+static int doPrintModuleMetaData(const CompilerInvocation &InitInvok,
+                                 const std::vector<std::string> ModulesToPrint) {
+  CompilerInvocation Invocation(InitInvok);
+
+  CompilerInstance CI;
+  // Display diagnostics to stderr.
+  PrintingDiagnosticConsumer PrintDiags;
+  CI.addDiagnosticConsumer(&PrintDiags);
+  if (CI.setup(Invocation))
+    return 1;
+  registerIDERequestFunctions(CI.getASTContext().evaluator);
+  auto &Context = CI.getASTContext();
+
+  // Load standard library so that Clang importer can use it.
+  auto *Stdlib = getModuleByFullName(Context, Context.StdlibModuleName);
+  if (!Stdlib) {
+    llvm::errs() << "Failed loading stdlib\n";
+    return 1;
+  }
+  int ExitCode = 0;
+  for (StringRef ModuleToPrint : ModulesToPrint) {
+    if (ModuleToPrint.empty()) {
+      ExitCode = 1;
+      continue;
+    }
+
+    // Get the (sub)module to print.
+    auto *M = getModuleByFullName(Context, ModuleToPrint);
+    if (!M) {
+      llvm::errs() << "error: could not find module '" << ModuleToPrint
+                   << "'\n";
+      ExitCode = 1;
+      continue;
+    }
+
+    // Split the module path.
+    std::vector<StringRef> ModuleName;
+    while (!ModuleToPrint.empty()) {
+      StringRef SubModuleName;
+      std::tie(SubModuleName, ModuleToPrint) = ModuleToPrint.split('.');
+      ModuleName.push_back(SubModuleName);
+    }
+    assert(!ModuleName.empty());
+
+    // FIXME: If ModuleToPrint is a submodule, get its top-level module, which
+    // will be the DeclContext for all of its Decls since we don't have first-
+    // class submodules.
+    if (ModuleName.size() > 1) {
+      M = getModuleByFullName(Context, ModuleName[0]);
+      if (!M) {
+        llvm::errs() << "error: could not find module '" << ModuleName[0]
+                     << "'\n";
+        ExitCode = 1;
+        continue;
+      }
+    }
+    printModuleMetadata(M);
+  }
+
+  return ExitCode;
+}
+
 static int doPrintModules(const CompilerInvocation &InitInvok,
                           const std::vector<std::string> ModulesToPrint,
                           const std::vector<std::string> GroupsToPrint,
@@ -2086,34 +2612,13 @@ static int doPrintModules(const CompilerInvocation &InitInvok,
       continue;
     }
 
-    // Split the module path.
-    std::vector<StringRef> ModuleName;
-    while (!ModuleToPrint.empty()) {
-      StringRef SubModuleName;
-      std::tie(SubModuleName, ModuleToPrint) = ModuleToPrint.split('.');
-      ModuleName.push_back(SubModuleName);
-    }
-    assert(!ModuleName.empty());
-
-    // FIXME: If ModuleToPrint is a submodule, get its top-level module, which
-    // will be the DeclContext for all of its Decls since we don't have first-
-    // class submodules.
-    if (ModuleName.size() > 1) {
-      M = getModuleByFullName(Context, ModuleName[0]);
-      if (!M) {
-        llvm::errs() << "error: could not find module '" << ModuleName[0]
-                     << "'\n";
-        ExitCode = 1;
-        continue;
-      }
-    }
     std::vector<StringRef> GroupNames;
     for (StringRef G : GroupsToPrint) {
       GroupNames.push_back(G);
     }
 
-    printSubmoduleInterface(M, ModuleName, GroupNames, TraversalOptions,
-                            *Printer, Options, SynthesizeExtensions);
+    printModuleInterface(M, GroupNames, TraversalOptions, *Printer, Options,
+                         SynthesizeExtensions);
   }
 
   return ExitCode;
@@ -2227,9 +2732,12 @@ static int doPrintDecls(const CompilerInvocation &InitInvok,
 
   for (const auto &name : DeclsToPrint) {
     ASTContext &ctx = CI.getASTContext();
-    UnqualifiedLookup lookup(ctx.getIdentifier(name),
-                             CI.getPrimarySourceFile(), nullptr);
-    for (auto result : lookup.Results) {
+    auto descriptor =
+        UnqualifiedLookupDescriptor(DeclNameRef(ctx.getIdentifier(name)),
+                                    CI.getPrimarySourceFile());
+    auto lookup = evaluateOrDefault(ctx.evaluator,
+                                    UnqualifiedLookupRequest{descriptor}, {});
+    for (auto result : lookup) {
       result.getValueDecl()->print(*Printer, Options);
 
       if (auto typeDecl = dyn_cast<TypeDecl>(result.getValueDecl())) {
@@ -2295,7 +2803,8 @@ public:
       SourceCode = SM.extractText({ SR.Start,
                                     SM.getByteDistance(SR.Start, EndCharLoc) });
       unsigned Column;
-      std::tie(Line, Column) = SM.getLineAndColumn(SR.Start, BufferID);
+      std::tie(Line, Column) =
+          SM.getPresumedLineAndColumnForLoc(SR.Start, BufferID);
     }
 
     OS.indent(IndentLevel * 2);
@@ -2500,6 +3009,18 @@ public:
     }
   }
 
+  void printSerializedLoc(Decl *D) {
+    auto moduleLoc = cast<FileUnit>(D->getDeclContext()->getModuleScopeContext())->
+      getBasicLocsForDecl(D);
+    if (!moduleLoc.hasValue())
+      return;
+    if (!moduleLoc->Loc.isValid())
+      return;
+    OS << moduleLoc->SourceFilePath
+       << ":" << moduleLoc->Loc.Line
+       << ":" << moduleLoc->Loc.Column << ": ";
+  }
+
   bool walkToDeclPre(Decl *D) override {
     if (D->isImplicit())
       return true;
@@ -2507,9 +3028,11 @@ public:
     if (auto *VD = dyn_cast<ValueDecl>(D)) {
       SourceLoc Loc = D->getLoc();
       if (Loc.isValid()) {
-        auto LineAndColumn = SM.getLineAndColumn(Loc);
-        OS << SM.getDisplayNameForLoc(VD->getLoc())
+        auto LineAndColumn = SM.getPresumedLineAndColumnForLoc(Loc);
+        OS << SM.getDisplayNameForLoc(Loc)
            << ":" << LineAndColumn.first << ":" << LineAndColumn.second << ": ";
+      } else {
+        printSerializedLoc(D);
       }
       OS << Decl::getKindName(VD->getKind()) << "/";
       printDeclName(VD);
@@ -2524,9 +3047,11 @@ public:
     } else if (isa<ExtensionDecl>(D)) {
       SourceLoc Loc = D->getLoc();
       if (Loc.isValid()) {
-        auto LineAndColumn = SM.getLineAndColumn(Loc);
-        OS << SM.getDisplayNameForLoc(D->getLoc())
+        auto LineAndColumn = SM.getPresumedLineAndColumnForLoc(Loc);
+        OS << SM.getDisplayNameForLoc(Loc)
         << ":" << LineAndColumn.first << ":" << LineAndColumn.second << ": ";
+      } else {
+        printSerializedLoc(D);
       }
       OS << Decl::getKindName(D->getKind()) << "/";
       OS << " ";
@@ -2658,26 +3183,27 @@ static int doPrintModuleImports(const CompilerInvocation &InitInvok,
     }
 
     SmallVector<ModuleDecl::ImportedModule, 16> scratch;
-    M->forAllVisibleModules({}, [&](const ModuleDecl::ImportedModule &next) {
-      llvm::outs() << next.second->getName();
-      if (next.second->isClangModule())
+    for (auto next : namelookup::getAllImports(M)) {
+      llvm::outs() << next.importedModule->getName();
+      if (next.importedModule->isClangModule())
         llvm::outs() << " (Clang)";
       llvm::outs() << ":\n";
 
       scratch.clear();
-      next.second->getImportedModules(scratch,
-                                      ModuleDecl::ImportFilterKind::Public);
+      next.importedModule->getImportedModules(
+          scratch, ModuleDecl::ImportFilterKind::Public);
+      // FIXME: ImportFilterKind::ShadowedBySeparateOverlay?
       for (auto &import : scratch) {
-        llvm::outs() << "\t" << import.second->getName();
-        for (auto accessPathPiece : import.first) {
-          llvm::outs() << "." << accessPathPiece.first;
+        llvm::outs() << "\t" << import.importedModule->getName();
+        for (auto accessPathPiece : import.accessPath) {
+          llvm::outs() << "." << accessPathPiece.Item;
         }
 
-        if (import.second->isClangModule())
+        if (import.importedModule->isClangModule())
           llvm::outs() << " (Clang)";
         llvm::outs() << "\n";
       }
-    });
+    }
   }
 
   return ExitCode;
@@ -2793,14 +3319,14 @@ private:
   void printUSR(const ValueDecl *VD, SourceLoc Loc) {
     printLoc(Loc);
     OS << ' ';
-    if (ide::printDeclUSR(VD, OS))
+    if (ide::printValueDeclUSR(VD, OS))
       OS << "ERROR:no-usr";
     OS << '\n';
   }
 
   void printLoc(SourceLoc Loc) {
     if (Loc.isValid()) {
-      auto LineCol = SM.getLineAndColumn(Loc, BufferID);
+      auto LineCol = SM.getPresumedLineAndColumnForLoc(Loc, BufferID);
       OS << LineCol.first << ':' << LineCol.second;
     }
   }
@@ -2879,7 +3405,7 @@ private:
     std::string USR;
     {
       llvm::raw_string_ostream OS(USR);
-      printDeclUSR(VD, OS);
+      printValueDeclUSR(VD, OS);
     }
 
     std::string error;
@@ -3128,7 +3654,7 @@ static int doPrintUSRs(const CompilerInvocation &InitInvok,
   return 0;
 }
 
-static int doTestCreateCompilerInvocation(ArrayRef<const char *> Args) {
+static int doTestCreateCompilerInvocation(ArrayRef<const char *> Args, bool ForceNoOutputs) {
   PrintingDiagnosticConsumer PDC;
   SourceManager SM;
   DiagnosticEngine Diags(SM);
@@ -3137,8 +3663,13 @@ static int doTestCreateCompilerInvocation(ArrayRef<const char *> Args) {
   CompilerInvocation CI;
   bool HadError = driver::getSingleFrontendInvocationFromDriverArguments(
       Args, Diags, [&](ArrayRef<const char *> FrontendArgs) {
+    llvm::outs() << "Frontend Arguments BEGIN\n";
+    for (const char *arg : FrontendArgs) {
+      llvm::outs() << arg << "\n";
+    }
+    llvm::outs() << "Frontend Arguments END\n";
     return CI.parseArgs(FrontendArgs, Diags);
-  });
+  }, ForceNoOutputs);
 
   if (HadError) {
     llvm::errs() << "error: unable to create a CompilerInvocation\n";
@@ -3149,16 +3680,12 @@ static int doTestCreateCompilerInvocation(ArrayRef<const char *> Args) {
 }
 
 static int doTestCompilerInvocationFromModule(StringRef ModuleFilePath) {
-  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileBufOrErr =
-      llvm::MemoryBuffer::getFile(ModuleFilePath);
-  if (!FileBufOrErr) {
-    llvm::errs() << "error opening input file: "
-      << FileBufOrErr.getError().message() << '\n';
-    return -1;
-  }
+  std::unique_ptr<llvm::MemoryBuffer> FileBuf;
+  if (setBufferForFile(ModuleFilePath, FileBuf))
+    return 1;
 
   CompilerInvocation CI;
-  StringRef Data = FileBufOrErr.get()->getBuffer();
+  StringRef Data = FileBuf->getBuffer();
   static_assert(static_cast<int>(serialization::Status::Valid) == 0,
                 "Status::Valid should be a successful exit");
   return static_cast<int>(CI.loadFromSerializedAST(Data));
@@ -3180,8 +3707,13 @@ int main(int argc, char *argv[]) {
     // llvm::cl::ParseCommandLineOptions.
     StringRef FirstArg(argv[1]);
     if (FirstArg == "-test-createCompilerInvocation") {
+      bool ForceNoOutputs = false;
       ArrayRef<const char *> Args(argv + 2, argc - 2);
-      return doTestCreateCompilerInvocation(Args);
+      if (argc > 2 && StringRef(argv[2]) == "-force-no-outputs") {
+        ForceNoOutputs = true;
+        Args = Args.drop_front();
+      }
+      return doTestCreateCompilerInvocation(Args, ForceNoOutputs);
     }
   }
 
@@ -3224,7 +3756,8 @@ int main(int argc, char *argv[]) {
 
     ide::PrintingCodeCompletionConsumer Consumer(
         llvm::outs(), options::CodeCompletionKeywords,
-        options::CodeCompletionComments);
+        options::CodeCompletionComments,
+        options::CodeCOmpletionAnnotateResults);
     for (StringRef filename : options::InputFilenames) {
       auto resultsOpt = ide::OnDiskCodeCompletionCache::getFromFile(filename);
       if (!resultsOpt) {
@@ -3274,6 +3807,8 @@ int main(int argc, char *argv[]) {
   InitInvok.getLangOptions().BuildSyntaxTree = true;
   InitInvok.getLangOptions().RequestEvaluatorGraphVizPath =
     options::GraphVisPath;
+  InitInvok.getLangOptions().EnableCrossImportOverlays =
+    options::EnableCrossImportOverlays;
   if (options::DisableObjCInterop) {
     InitInvok.getLangOptions().EnableObjCInterop = false;
   } else if (options::EnableObjCInterop) {
@@ -3282,6 +3817,15 @@ int main(int argc, char *argv[]) {
     InitInvok.getLangOptions().EnableObjCInterop =
         llvm::Triple(options::Triple).isOSDarwin();
   }
+  if (options::EnableCxxInterop) {
+    InitInvok.getLangOptions().EnableCXXInterop = true;
+  }
+
+  // We disable source location resolutions from .swiftsourceinfo files by
+  // default to match sourcekitd-test's and ide clients' expected behavior
+  // (passing optimize-for-ide in the global configuration request).
+  if (!options::EnableSwiftSourceInfo)
+    InitInvok.getFrontendOptions().IgnoreSwiftSourceInfo = true;
   if (!options::Triple.empty())
     InitInvok.setTargetTriple(options::Triple);
   if (!options::SwiftVersion.empty()) {
@@ -3337,17 +3881,21 @@ int main(int argc, char *argv[]) {
   for (auto &Arg : options::ClangXCC) {
     InitInvok.getClangImporterOptions().ExtraArgs.push_back(Arg);
   }
-  InitInvok.getLangOptions().DebugForbidTypecheckPrefix =
-    options::DebugForbidTypecheckPrefix;
   InitInvok.getLangOptions().EnableObjCAttrRequiresFoundation =
     !options::DisableObjCAttrRequiresFoundationModule;
-
-  InitInvok.getLangOptions().DebugConstraintSolver =
+  InitInvok.getTypeCheckerOptions().DebugForbidTypecheckPrefix =
+    options::DebugForbidTypecheckPrefix;
+  InitInvok.getTypeCheckerOptions().DebugConstraintSolver =
       options::DebugConstraintSolver;
 
   for (auto ConfigName : options::BuildConfigs)
     InitInvok.getLangOptions().addCustomConditionalCompilationFlag(ConfigName);
 
+  if (!options::ExplicitSwiftModuleMap.empty()) {
+    InitInvok.getSearchPathOptions().ExplicitSwiftModuleMap =
+      options::ExplicitSwiftModuleMap;
+    InitInvok.getFrontendOptions().DisableImplicitModules = true;
+  }
   // Process the clang arguments last and allow them to override previously
   // set options.
   if (!CCArgs.empty()) {
@@ -3412,6 +3960,19 @@ int main(int argc, char *argv[]) {
   case ActionType::DumpCompletionCache:
     llvm_unreachable("should be handled above");
 
+  case ActionType::BatchCodeCompletion:
+    if (options::FileCheckPath.empty() && !options::SkipFileCheck) {
+      llvm::errs() << "'FileCheck' path required or explicitly specify "
+                   << "'-skip-filecheck'\n";
+      return 1;
+    }
+    ExitCode = doBatchCodeCompletion(InitInvok,
+                                     options::SourceFilename,
+                                     options::CodeCompletionDiagnostics,
+                                     options::CodeCompletionKeywords,
+                                     options::CodeCompletionComments);
+    break;
+
   case ActionType::CodeCompletion:
     if (options::CodeCompletionToken.empty()) {
       llvm::errs() << "code completion token name required\n";
@@ -3423,7 +3984,8 @@ int main(int argc, char *argv[]) {
                                 options::CodeCompletionToken,
                                 options::CodeCompletionDiagnostics,
                                 options::CodeCompletionKeywords,
-                                options::CodeCompletionComments);
+                                options::CodeCompletionComments,
+                                options::CodeCOmpletionAnnotateResults);
     break;
 
   case ActionType::REPLCodeCompletion:
@@ -3524,7 +4086,10 @@ int main(int argc, char *argv[]) {
     }
     break;
   }
-
+  case ActionType::PrintModuleMetadata: {
+    ExitCode = doPrintModuleMetaData(InitInvok, options::ModuleToPrint);
+    break;
+  }
   case ActionType::PrintHeader: {
     ExitCode = doPrintHeaders(
         InitInvok, options::HeaderToPrint, PrintOpts,

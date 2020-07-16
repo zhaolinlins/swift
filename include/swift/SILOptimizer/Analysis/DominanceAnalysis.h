@@ -16,7 +16,6 @@
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/Dominance.h"
 #include "swift/SILOptimizer/Analysis/Analysis.h"
-#include "llvm/ADT/DenseMap.h"
 
 namespace swift {
 class SILModule;
@@ -42,7 +41,7 @@ public:
   }
 
   std::unique_ptr<DominanceInfo> newFunctionAnalysis(SILFunction *F) override {
-    return llvm::make_unique<DominanceInfo>(F);
+    return std::make_unique<DominanceInfo>(F);
   }
 
   virtual bool shouldInvalidate(SILAnalysis::InvalidationKind K) override {
@@ -72,7 +71,7 @@ public:
 
   std::unique_ptr<PostDominanceInfo>
   newFunctionAnalysis(SILFunction *F) override {
-    return llvm::make_unique<PostDominanceInfo>(F);
+    return std::make_unique<PostDominanceInfo>(F);
   }
 
   virtual bool shouldInvalidate(SILAnalysis::InvalidationKind K) override {

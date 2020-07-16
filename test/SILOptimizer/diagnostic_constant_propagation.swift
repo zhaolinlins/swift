@@ -1,4 +1,5 @@
 // RUN: %target-swift-frontend -emit-sil -primary-file %s -o /dev/null -verify
+// RUN: %target-swift-frontend -emit-sil -primary-file %s -o /dev/null -verify
 //
 // These are tests for diagnostics produced by constant propagation pass.
 // Due to the change in the implementation of Integer initializers some of the
@@ -360,7 +361,7 @@ func testBuiltinGlobalStringTablePointerNoError() -> UnsafePointer<CChar> {
 }
 
 func testBuiltinGlobalStringTablePointerError(s: String) -> UnsafePointer<CChar> {
-  return _getGlobalStringTablePointer(s) // expected-error {{globalStringTablePointer builtin must used only on string literals}}
+  return _getGlobalStringTablePointer(s) // expected-error {{globalStringTablePointer builtin must be used only on string literals}}
 }
 
 @_transparent

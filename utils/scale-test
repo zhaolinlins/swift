@@ -25,21 +25,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
-
 from collections import namedtuple
 from operator import attrgetter
+
+from build_swift.build_swift import shell
 
 import gyb
 
 from jobstats import load_stats_dir, merge_all_jobstats
-
-
-def find_which(p):
-    for d in os.environ["PATH"].split(os.pathsep):
-        full = os.path.join(d, p)
-        if os.path.isfile(full) and os.access(full, os.X_OK):
-            return full
-    return p
 
 
 # Evidently the debug-symbol reader in dtrace is sufficiently slow and/or buggy
@@ -48,7 +41,7 @@ def find_which(p):
 # entries, see rdar://problem/7037927 or rdar://problem/11490861 respectively),
 # so we sniff the presence of debug symbols here.
 def has_debuginfo(swiftc):
-    swiftc = find_which(swiftc)
+    swiftc = shell.which(swiftc)
     for line in subprocess.check_output(
             ["dwarfdump", "--file-stats", swiftc]).splitlines():
         if '%' not in line:
@@ -69,7 +62,7 @@ def write_input_file(args, ast, d, n):
 
 def ensure_tmpdir(d):
     if d is not None and not os.path.exists(d):
-        os.makedirs(d, 0700)
+        os.makedirs(d, 0o700)
     return tempfile.mkdtemp(dir=d)
 
 
@@ -81,7 +74,7 @@ def supports_stats_output_dir(args):
     sd = os.path.join(d, "stats-probe")
 
     try:
-        os.makedirs(sd, 0700)
+        os.makedirs(sd, 0o700)
         # Write a trivial test program and try running with
         # -stats-output-dir
         testpath = os.path.join(sd, "test.swift")
@@ -368,7 +361,7 @@ def fit_function_to_data_by_least_squares(objective, params, bounds, xs, ys):
     assert(len(ys) > 0)
     mean_y = sum(ys) / len(ys)
     ss_total = sum((y - mean_y) ** 2 for y in ys)
-    data = zip(xs, ys)
+    data = list(zip(xs, ys))
 
     def inner(ps):
         s = 0.0

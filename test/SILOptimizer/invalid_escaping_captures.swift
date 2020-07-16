@@ -1,4 +1,5 @@
 // RUN: %target-swift-frontend -emit-sil %s -verify
+// RUN: %target-swift-frontend -emit-sil %s -verify
 
 func takesEscaping(_: @escaping () -> ()) {}
 
@@ -53,7 +54,7 @@ func badLocalFunctionCaptureInOut1(x: inout Int) { // expected-note {{parameter 
     x += 1 // expected-note {{captured here}}
   }
 
-  takesEscaping(local) // expected-error {{escaping closure captures 'inout' parameter 'x'}}
+  takesEscaping(local) // expected-error {{escaping local function captures 'inout' parameter 'x'}}
 }
 
 func badLocalFunctionCaptureInOut2(x: inout Int) { // expected-note {{parameter 'x' is declared 'inout'}}
@@ -75,7 +76,7 @@ func badLocalFunctionCaptureInOut3(x: inout Int) { // expected-note {{parameter 
     local1() // expected-note {{captured indirectly by this call}}
   }
 
-  takesEscaping(local2) // expected-error {{escaping closure captures 'inout' parameter 'x'}}
+  takesEscaping(local2) // expected-error {{escaping local function captures 'inout' parameter 'x'}}
 }
 
 func badLocalFunctionCaptureNoEscape1(y: () -> ()) { // expected-note {{parameter 'y' is implicitly non-escaping}}
@@ -83,7 +84,7 @@ func badLocalFunctionCaptureNoEscape1(y: () -> ()) { // expected-note {{paramete
     y() // expected-note {{captured here}}
   }
 
-  takesEscaping(local) // expected-error {{escaping closure captures non-escaping parameter 'y'}}
+  takesEscaping(local) // expected-error {{escaping local function captures non-escaping parameter 'y'}}
 }
 
 func badLocalFunctionCaptureNoEscape2(y: () -> ()) { // expected-note {{parameter 'y' is implicitly non-escaping}}
@@ -105,7 +106,7 @@ func badLocalFunctionCaptureNoEscape3(y: () -> ()) { // expected-note {{paramete
     local1() // expected-note {{captured indirectly by this call}}
   }
 
-  takesEscaping(local2) // expected-error {{escaping closure captures non-escaping parameter 'y'}}
+  takesEscaping(local2) // expected-error {{escaping local function captures non-escaping parameter 'y'}}
 }
 
 func badLocalFunctionCaptureNoEscape4(y: () -> ()) { // expected-note {{parameter 'y' is implicitly non-escaping}}
@@ -117,7 +118,7 @@ func badLocalFunctionCaptureNoEscape4(y: () -> ()) { // expected-note {{paramete
     local1() // expected-note {{captured indirectly by this call}}
   }
 
-  takesEscaping(local2) // expected-error {{escaping closure captures non-escaping parameter 'y'}}
+  takesEscaping(local2) // expected-error {{escaping local function captures non-escaping parameter 'y'}}
 }
 
 // Capturing 'self' produces a different diagnostic.
@@ -151,7 +152,7 @@ func testGenericLocalFunctionReabstraction(x: inout Int) { // expected-note {{pa
     x += 1 // expected-note {{captured here}}
     return 0
   }
-  takesEscapingGeneric(local) // expected-error {{escaping closure captures 'inout' parameter 'x'}}
+  takesEscapingGeneric(local) // expected-error {{escaping local function captures 'inout' parameter 'x'}}
 }
 
 // Make sure that withoutActuallyEscaping counts as a safe use.
@@ -187,4 +188,62 @@ public struct SelfEscapeFromInit {
   }
 
   public mutating func handler() {}
+}
+
+func autoclosureTakesEscaping(_ x: @escaping @autoclosure () ->Int) {}
+
+// Test that captures of escaping autoclosure are diagnosed correctly.
+func badCaptureInAutoclosure(x: inout Int) {
+    // expected-note@-1 {{parameter 'x' is declared 'inout'}}
+    // expected-note@-2 {{parameter 'x' is declared 'inout'}}
+
+  autoclosureTakesEscaping(x)
+    // expected-error@-1 {{escaping autoclosure captures 'inout' parameter 'x'}}
+    // expected-note@-2 {{pass a copy of 'x'}}
+
+  autoclosureTakesEscaping((x + 1) - 100)
+    // expected-error@-1 {{escaping autoclosure captures 'inout' parameter 'x'}}
+    // expected-note@-2 {{pass a copy of 'x'}}
+}
+
+// Test that transitive captures in autoclosures are diagnosed correctly.
+func badTransitiveCaptureInClosures(x: inout Int) -> ((Int) -> Void) {
+    // expected-note@-1 {{parameter 'x' is declared 'inout'}}
+    // expected-note@-2 {{parameter 'x' is declared 'inout'}}
+    // expected-note@-3 {{parameter 'x' is declared 'inout'}}
+
+  // Test capture of x by an autoclosure within a non-escaping closure.
+  let _ = { (y: Int) in
+    autoclosureTakesEscaping(x + y)
+      // expected-error@-1 {{escaping autoclosure captures 'inout' parameter 'x'}}
+      // expected-note@-2 {{pass a copy of 'x'}}
+  }
+
+  // Test capture of x by an autoclosure within an escaping closure.
+  let escapingClosure = { (y: Int) in
+      // expected-error@-1 {{escaping closure captures 'inout' parameter 'x'}}
+
+    autoclosureTakesEscaping(x + y)
+      // expected-note@-1 {{captured indirectly by this call}}
+      // expected-note@-2 {{captured here}}
+
+      // expected-error@-4 {{escaping autoclosure captures 'inout' parameter 'x'}}
+      // expected-note@-5 {{pass a copy of 'x'}}
+  }
+  return escapingClosure
+}
+
+// Test that captures of mutating 'self' in escaping autoclosures are diagnosed correctly.
+struct S {
+  var i = 0
+  init() {
+    autoclosureTakesEscaping(i)
+      // expected-error@-1 {{escaping autoclosure captures mutating 'self' parameter}}
+      // expected-note@-2 {{pass a copy of 'self'}}
+  }
+  mutating func method() {
+    autoclosureTakesEscaping(i)
+      // expected-error@-1 {{escaping autoclosure captures mutating 'self' parameter}}
+      // expected-note@-2 {{pass a copy of 'self'}}
+  }
 }

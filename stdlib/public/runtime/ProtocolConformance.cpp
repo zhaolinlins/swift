@@ -14,7 +14,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/Basic/LLVM.h"
 #include "swift/Basic/Lazy.h"
 #include "swift/Demangling/Demangle.h"
 #include "swift/Runtime/Casting.h"
@@ -31,9 +30,7 @@
 using namespace swift;
 
 #ifndef NDEBUG
-template <>
-LLVM_ATTRIBUTE_USED
-void ProtocolDescriptor::dump() const {
+template <> SWIFT_USED void ProtocolDescriptor::dump() const {
   printf("TargetProtocolDescriptor.\n"
          "Name: \"%s\".\n",
          Name.get());
@@ -95,9 +92,7 @@ template<> void ProtocolConformanceDescriptor::dump() const {
 #endif
 
 #ifndef NDEBUG
-template<>
-LLVM_ATTRIBUTE_USED
-void ProtocolConformanceDescriptor::verify() const {
+template <> SWIFT_USED void ProtocolConformanceDescriptor::verify() const {
   auto typeKind = unsigned(getTypeKind());
   assert(((unsigned(TypeReferenceKind::First_Kind) <= typeKind) &&
           (unsigned(TypeReferenceKind::Last_Kind) >= typeKind)) &&
@@ -145,14 +140,15 @@ ProtocolConformanceDescriptor::getCanonicalTypeMetadata() const {
 
   case TypeReferenceKind::DirectTypeDescriptor:
   case TypeReferenceKind::IndirectTypeDescriptor: {
-    auto anyType = getTypeDescriptor();
-    if (auto type = dyn_cast<TypeContextDescriptor>(anyType)) {
-      if (!type->isGeneric()) {
-        if (auto accessFn = type->getAccessFunction())
-          return accessFn(MetadataState::Abstract).Value;
+    if (auto anyType = getTypeDescriptor()) {
+      if (auto type = dyn_cast<TypeContextDescriptor>(anyType)) {
+        if (!type->isGeneric()) {
+          if (auto accessFn = type->getAccessFunction())
+            return accessFn(MetadataState::Abstract).Value;
+        }
+      } else if (auto protocol = dyn_cast<ProtocolDescriptor>(anyType)) {
+        return _getSimpleProtocolTypeMetadata(protocol);
       }
-    } else if (auto protocol = dyn_cast<ProtocolDescriptor>(anyType)) {
-      return _getSimpleProtocolTypeMetadata(protocol);
     }
 
     return nullptr;
@@ -166,7 +162,7 @@ template<>
 const WitnessTable *
 ProtocolConformanceDescriptor::getWitnessTable(const Metadata *type) const {
   // If needed, check the conditional requirements.
-  SmallVector<const void *, 8> conditionalArgs;
+  llvm::SmallVector<const void *, 8> conditionalArgs;
   if (hasConditionalRequirements()) {
     SubstGenericParametersFromMetadata substitutions(type);
     bool failed =
@@ -195,11 +191,10 @@ namespace {
   };
 
   struct ConformanceCacheKey {
-    /// Either a Metadata* or a NominalTypeDescriptor*.
-    const void *Type;
+    const Metadata *Type;
     const ProtocolDescriptor *Proto;
 
-    ConformanceCacheKey(const void *type, const ProtocolDescriptor *proto)
+    ConformanceCacheKey(const Metadata *type, const ProtocolDescriptor *proto)
         : Type(type), Proto(proto) {
       assert(type);
     }
@@ -207,7 +202,7 @@ namespace {
 
   struct ConformanceCacheEntry {
   private:
-    const void *Type; 
+    const Metadata *Type; 
     const ProtocolDescriptor *Proto;
     std::atomic<const ProtocolConformanceDescriptor *> Description;
     std::atomic<size_t> FailureGeneration;
@@ -271,7 +266,7 @@ struct ConformanceState {
     initializeProtocolConformanceLookup();
   }
 
-  void cacheSuccess(const void *type, const ProtocolDescriptor *proto,
+  void cacheSuccess(const Metadata *type, const ProtocolDescriptor *proto,
                     const ProtocolConformanceDescriptor *description) {
     auto result = Cache.getOrInsert(ConformanceCacheKey(type, proto),
                                     description, 0);
@@ -282,7 +277,7 @@ struct ConformanceState {
     }
   }
 
-  void cacheFailure(const void *type, const ProtocolDescriptor *proto,
+  void cacheFailure(const Metadata *type, const ProtocolDescriptor *proto,
                     size_t failureGeneration) {
     auto result =
       Cache.getOrInsert(ConformanceCacheKey(type, proto),
@@ -295,13 +290,13 @@ struct ConformanceState {
     }
   }
 
-  ConformanceCacheEntry *findCached(const void *type,
+  ConformanceCacheEntry *findCached(const Metadata *type,
                                     const ProtocolDescriptor *proto) {
     return Cache.find(ConformanceCacheKey(type, proto));
   }
 
 #ifndef NDEBUG
-  void verify() const LLVM_ATTRIBUTE_USED;
+  void verify() const SWIFT_USED;
 #endif
 };
 
@@ -320,6 +315,9 @@ void ConformanceState::verify() const {
 
 static Lazy<ConformanceState> Conformances;
 
+const void * const swift::_swift_debug_protocolConformanceStatePointer =
+  &Conformances;
+
 static void
 _registerProtocolConformances(ConformanceState &C,
                               const ProtocolConformanceRecord *begin,
@@ -327,8 +325,8 @@ _registerProtocolConformances(ConformanceState &C,
   C.SectionsToScan.push_back(ConformanceSection{begin, end});
 }
 
-void swift::addImageProtocolConformanceBlockCallback(const void *conformances,
-                                                   uintptr_t conformancesSize) {
+void swift::addImageProtocolConformanceBlockCallbackUnsafe(
+    const void *conformances, uintptr_t conformancesSize) {
   assert(conformancesSize % sizeof(ProtocolConformanceRecord) == 0 &&
          "conformances section not a multiple of ProtocolConformanceRecord");
 
@@ -343,6 +341,13 @@ void swift::addImageProtocolConformanceBlockCallback(const void *conformances,
   // Conformance cache should always be sufficiently initialized by this point.
   _registerProtocolConformances(Conformances.unsafeGetAlreadyInitialized(),
                                 recordsBegin, recordsEnd);
+}
+
+void swift::addImageProtocolConformanceBlockCallback(
+    const void *conformances, uintptr_t conformancesSize) {
+  Conformances.get();
+  addImageProtocolConformanceBlockCallbackUnsafe(conformances,
+                                                 conformancesSize);
 }
 
 void
@@ -382,15 +387,6 @@ struct ConformanceCacheResult {
     return ConformanceCacheResult { false, nullptr, nullptr };
   }
 };
-
-/// Retrieve the type key from the given metadata, to be used when looking
-/// into the conformance cache.
-static const void *getConformanceCacheTypeKey(const Metadata *type) {
-  if (auto description = type->getTypeContextDescriptor())
-    return description;
-
-  return type;
-}
 
 /// Search for a conformance descriptor in the ConformanceCache.
 static
@@ -440,22 +436,6 @@ recur:
     }
   }
 
-  {
-    // For generic and resilient types, nondependent conformances
-    // are keyed by the nominal type descriptor rather than the
-    // metadata, so try that.
-    auto typeKey = getConformanceCacheTypeKey(type);
-
-    // Hash and lookup the type-protocol pair in the cache.
-    if (auto *Value = C.findCached(typeKey, protocol)) {
-      if (Value->isSuccessful())
-        return ConformanceCacheResult::cachedSuccess(Value->getDescription());
-
-      // We don't try to cache negative responses for generic
-      // patterns.
-    }
-  }
-
   // If there is a superclass, look there.
   if (auto superclass = _swift_class_getSuperclass(type)) {
     type = superclass;
@@ -473,7 +453,7 @@ recur:
 
 namespace {
   /// Describes a protocol conformance "candidate" that can be checked
-  /// against the
+  /// against a type metadata.
   class ConformanceCandidate {
     const void *candidate;
     bool candidateIsMetadata;
@@ -484,15 +464,15 @@ namespace {
     ConformanceCandidate(const ProtocolConformanceDescriptor &conformance)
       : ConformanceCandidate()
     {
-      if (auto metadata = conformance.getCanonicalTypeMetadata()) {
-        candidate = metadata;
-        candidateIsMetadata = true;
-        return;
-      }
-
       if (auto description = conformance.getTypeDescriptor()) {
         candidate = description;
         candidateIsMetadata = false;
+        return;
+      }
+
+      if (auto metadata = conformance.getCanonicalTypeMetadata()) {
+        candidate = metadata;
+        candidateIsMetadata = true;
         return;
       }
     }
@@ -505,6 +485,29 @@ namespace {
                                  : nullptr;
     }
 
+    const ContextDescriptor *
+    getContextDescriptor(const Metadata *conformingType) const {
+      const auto *description = conformingType->getTypeContextDescriptor();
+      if (description)
+        return description;
+
+      // Handle single-protocol existential types for self-conformance.
+      auto *existentialType = dyn_cast<ExistentialTypeMetadata>(conformingType);
+      if (existentialType == nullptr ||
+          existentialType->getProtocols().size() != 1 ||
+          existentialType->getSuperclassConstraint() != nullptr)
+        return nullptr;
+
+      auto proto = existentialType->getProtocols()[0];
+
+#if SWIFT_OBJC_INTEROP
+      if (proto.isObjC())
+        return nullptr;
+#endif
+
+      return proto.getSwiftProtocol();
+    }
+
     /// Whether the conforming type exactly matches the conformance candidate.
     bool matches(const Metadata *conformingType) const {
       // Check whether the types match.
@@ -513,7 +516,7 @@ namespace {
 
       // Check whether the nominal type descriptors match.
       if (!candidateIsMetadata) {
-        const auto *description = conformingType->getTypeContextDescriptor();
+        const auto *description = getContextDescriptor(conformingType);
         auto candidateDescription =
           static_cast<const ContextDescriptor *>(candidate);
         if (description && equalContexts(description, candidateDescription))
@@ -573,7 +576,7 @@ swift_conformsToSwiftProtocolImpl(const Metadata * const type,
   }
 
   // Really scan conformance records.
-  for (size_t i = startIndex; i < endIndex; i++) {
+  for (size_t i = startIndex; i < endIndex; ++i) {
     auto &section = snapshot.Start[i];
     // Eagerly pull records for nondependent witnesses into our cache.
     for (const auto &record : section) {
@@ -634,9 +637,140 @@ swift::_searchConformancesByMangledTypeName(Demangle::NodePointer node) {
   return nullptr;
 }
 
+static MetadataState
+tryGetCompleteMetadataNonblocking(const Metadata *metadata) {
+  return swift_checkMetadataState(
+             MetadataRequest(MetadataState::Complete, /*isNonBlocking*/ true),
+             metadata)
+      .State;
+}
+
+template <typename HandleObjc>
+bool isSwiftClassMetadataSubclass(const ClassMetadata *subclass,
+                                  const ClassMetadata *superclass,
+                                  HandleObjc handleObjc) {
+  assert(subclass);
+  assert(superclass);
+
+  MetadataState subclassState = tryGetCompleteMetadataNonblocking(subclass);
+
+  do {
+    if (subclassState == MetadataState::Complete) {
+      // The subclass metadata is complete.  That means not just that its
+      // Superclass field is valid, but that the Superclass field of the
+      // referenced class metadata is valid, and the Superclass field of the
+      // class metadata referenced there, and so on transitively.
+      //
+      // Scan the superclass chains in the ClassMetadata looking for a match.
+      while ((subclass = subclass->Superclass)) {
+        if (subclass == superclass)
+          return true;
+      }
+      return false;
+    }
+    if (subclassState == MetadataState::NonTransitiveComplete) {
+      // The subclass metadata is complete, but, unlike above, not transitively.
+      // Its Superclass field is valid, so just read that field to get to the
+      // superclass to proceed to the next step.
+      subclass = subclass->Superclass;
+      if (subclass->isPureObjC()) {
+        return handleObjc(subclass, superclass);
+      }
+      subclassState = tryGetCompleteMetadataNonblocking(subclass);
+    } else {
+      // The subclass metadata is either LayoutComplete or Abstract, so the
+      // Superclass field is not valid.  To get to the superclass, make the
+      // expensive call to getSuperclassMetadata which demangles the superclass
+      // name from the nominal type descriptor to get the metadata for the
+      // superclass.
+      MetadataRequest request(MetadataState::Complete,
+                              /*non-blocking*/ true);
+      auto response = getSuperclassMetadata(request, subclass);
+      auto newMetadata = response.Value;
+      if (auto newSubclass = dyn_cast<ClassMetadata>(newMetadata)) {
+        subclass = newSubclass;
+        subclassState = response.State;
+      } else {
+        return handleObjc(newMetadata, superclass);
+      }
+    }
+    if (subclass == superclass)
+      return true;
+  } while (subclass);
+  return false;
+}
+
+// Whether the provided `subclass` is metadata for a subclass* of the superclass
+// whose metadata is specified.
+//
+// The function is robust against incomplete metadata for both subclass and
+// superclass.  In the worst case, each intervening class between subclass and
+// superclass is demangled.  Besides that slow path, there are a number of fast
+// paths:
+// - both classes are ObjC: swift_dynamicCastMetatype
+// - Complete subclass metadata: loop over Superclass fields
+// - NonTransitiveComplete: read the Superclass field once
+//
+// * A non-strict subclass; that is, given a class X, isSubclass(X.self, X.self)
+//   is true.
+static bool isSubclass(const Metadata *subclass, const Metadata *superclass) {
+  assert(subclass);
+  assert(superclass);
+  assert(subclass->isAnyClass());
+  assert(superclass->isAnyClass());
+
+  if (subclass == superclass)
+    return true;
+  if (!isa<ClassMetadata>(subclass)) {
+    if (!isa<ClassMetadata>(superclass)) {
+      // Only ClassMetadata can be incomplete; when the class metadata is not
+      // ClassMetadata, just use swift_dynamicCastMetatype.
+      return swift_dynamicCastMetatype(subclass, superclass);
+    } else {
+      // subclass is ObjC, but superclass is not; since it is not possible for
+      // any ObjC class to be a subclass of any Swift class, this subclass is
+      // not a subclass of this superclass.
+      return false;
+    }
+  }
+  const ClassMetadata *swiftSubclass = cast<ClassMetadata>(subclass);
+  if (auto *objcSuperclass = dyn_cast<ObjCClassWrapperMetadata>(superclass)) {
+    // Walk up swiftSubclass's ancestors until we get to an ObjC class, then
+    // kick over to swift_dynamicCastMetatype.
+    return isSwiftClassMetadataSubclass(
+        swiftSubclass, objcSuperclass->Class,
+        [](const Metadata *intermediate, const Metadata *superclass) {
+          // Intermediate is an ObjC class, and superclass is an ObjC class;
+          // as above, just use swift_dynamicCastMetatype.
+          return swift_dynamicCastMetatype(intermediate, superclass);
+        });
+    return false;
+  }
+  if (isa<ForeignClassMetadata>(superclass)) {
+    // superclass is foreign, but subclass is not (if it were, the above
+    // !isa<ClassMetadata> condition would have been entered).  Since it is not
+    // possible for any Swift class to be a subclass of any foreign superclass,
+    // this subclass is not a subclass of this superclass.
+    return false;
+  }
+  auto swiftSuperclass = cast<ClassMetadata>(superclass);
+  return isSwiftClassMetadataSubclass(swiftSubclass, swiftSuperclass,
+                                      [](const Metadata *, const Metadata *) {
+                                        // Because (1) no ObjC classes inherit
+                                        // from Swift classes and (2)
+                                        // `superclass` is not ObjC, if some
+                                        // ancestor of `subclass` is ObjC, then
+                                        // `subclass` cannot descend from
+                                        // `superclass` (otherwise at some point
+                                        // some ObjC class would have to inherit
+                                        // from a Swift class).
+                                        return false;
+                                      });
+}
+
 bool swift::_checkGenericRequirements(
                       llvm::ArrayRef<GenericRequirementDescriptor> requirements,
-                      SmallVectorImpl<const void *> &extraArguments,
+                      llvm::SmallVectorImpl<const void *> &extraArguments,
                       SubstGenericParameterFn substGenericParam,
                       SubstDependentWitnessTableFn substWitnessTable) {
   for (const auto &req : requirements) {
@@ -707,11 +841,17 @@ bool swift::_checkGenericRequirements(
                                    substGenericParam, substWitnessTable).getMetadata();
       if (!baseType) return true;
 
-      // Check whether it's dynamically castable, which works as a superclass
-      // check.
-      // FIXME: We should be explicitly checking the superclass, so we
-      // don't require the subject type to be complete.
-      if (!swift_dynamicCastMetatype(subjectType, baseType)) return true;
+      // If the type which is constrained to a base class is an existential 
+      // type, and if that existential type includes a superclass constraint,
+      // just require that the superclass by which the existential is
+      // constrained is a subclass of the base class.
+      if (auto *existential = dyn_cast<ExistentialTypeMetadata>(subjectType)) {
+        if (auto *superclassConstraint = existential->getSuperclassConstraint())
+          subjectType = superclassConstraint;
+      }
+
+      if (!isSubclass(subjectType, baseType))
+        return true;
 
       continue;
     }

@@ -87,13 +87,13 @@ Double(1) as Double as String // expected-error{{cannot convert value of type 'D
 // expected-error@-1 2 {{cannot convert value of type 'Int' to expected element type 'String'}}
 // expected-error@-2   {{cannot convert value of type 'Double' to expected element type 'String'}}
 [[1]] as [[String]] // expected-error{{cannot convert value of type 'Int' to expected element type 'String'}}
-(1, 1.0) as (Int, Int) // expected-error{{cannot convert value of type 'Double' to type 'Int' in coercion}}
-(1.0, 1, "asd") as (String, Int, Float) // expected-error{{cannot convert value of type 'Double' to type 'String' in coercion}}
+(1, 1.0) as (Int, Int) // expected-error{{cannot convert value of type '(Int, Double)' to type '(Int, Int)' in coercion}}
+(1.0, 1, "asd") as (String, Int, Float) // expected-error{{cannot convert value of type '(Double, Int, String)' to type '(String, Int, Float)' in coercion}}
 (1, 1.0, "a", [1, 23]) as (Int, Double, String, [String])
 // expected-error@-1 2 {{cannot convert value of type 'Int' to expected element type 'String'}}
 
-_ = [1] as! [String] // expected-warning{{cast from '[Int]' to unrelated type '[String]' always fails}}
-_ = [(1, (1, 1))] as! [(Int, (String, Int))] // expected-warning{{cast from '[(Int, (Int, Int))]' to unrelated type '[(Int, (String, Int))]' always fails}}
+_ = [1] as! [String] // OK
+_ = [(1, (1, 1))] as! [(Int, (String, Int))] // OK
 
 // <rdar://problem/19495253> Incorrect diagnostic for explicitly casting to the same type
 _ = "hello" as! String // expected-warning{{forced cast of 'String' to same type has no effect}} {{13-24=}}

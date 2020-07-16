@@ -1,7 +1,7 @@
 // RUN: %empty-directory(%t)
 // RUN: %build-clang-importer-objc-overlays
 
-// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk-nosource -I %t) -target x86_64-apple-macosx10.51 -typecheck %s -verify
+// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk-nosource -I %t) -target %target-cpu-apple-macosx10.51 -typecheck %s -verify
 
 // REQUIRES: OS=macosx
 // REQUIRES: objc_interop
@@ -23,8 +23,7 @@ func testInstanceTypeFactoryMethodInherited() {
   _ = NSObjectFactorySub(integer: 1)
   _ = NSObjectFactorySub(double: 314159)
   _ = NSObjectFactorySub(float: 314159) // expected-error{{incorrect argument label in call (have 'float:', expected 'integer:')}}
-  let a = NSObjectFactorySub(buildingWidgets: ()) // expected-error{{argument labels '(buildingWidgets:)' do not match any available overloads}}
-  // expected-note @-1 {{overloads for 'NSObjectFactorySub' exist with these partially matching parameter lists: (double: Double), (integer: Int)}}
+  let a = NSObjectFactorySub(buildingWidgets: ()) // expected-error{{argument passed to call that takes no arguments}}
   _ = a
 }
 
@@ -46,7 +45,7 @@ func testFactoryWithLaterIntroducedInit() {
     // expected-note @-1 {{add 'if #available' version check}}
   
   _ = NSHavingConvenienceFactoryAndLaterDesignatedInit(flam:5) // expected-error {{'init(flam:)' is only available in macOS 10.52 or newer}}
-  // expected-note @-1 {{add 'if #available' version check}}  {{3-63=if #available(OSX 10.52, *) {\n      _ = NSHavingConvenienceFactoryAndLaterDesignatedInit(flam:5)\n  \} else {\n      // Fallback on earlier versions\n  \}}}
+  // expected-note @-1 {{add 'if #available' version check}}  {{3-63=if #available(macOS 10.52, *) {\n      _ = NSHavingConvenienceFactoryAndLaterDesignatedInit(flam:5)\n  \} else {\n      // Fallback on earlier versions\n  \}}}
 
   
   // Don't prefer more available factory initializer over less
@@ -76,8 +75,7 @@ func testNSErrorFactoryMethod(_ path: String) throws {
 }
 
 func testNonInstanceTypeFactoryMethod(_ s: String) {
-  _ = NSObjectFactory(string: s) // expected-error{{argument labels '(string:)' do not match any available overloads}}
-  // expected-note @-1 {{(double: Double), (float: Float), (integer: Int)}}
+  _ = NSObjectFactory(string: s) // expected-error{{argument passed to call that takes no arguments}}
 }
 
 func testUseOfFactoryMethod(_ queen: Bee) {

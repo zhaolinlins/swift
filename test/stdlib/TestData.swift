@@ -3806,30 +3806,174 @@ class TestData : TestDataSuper {
     }
 
     func test_nsdataSequence() {
-        let bytes: [UInt8] = Array(0x00...0xFF)
-        let data = bytes.withUnsafeBytes { NSData(bytes: $0.baseAddress, length: $0.count) }
+        if #available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *) {
+            let bytes: [UInt8] = Array(0x00...0xFF)
+            let data = bytes.withUnsafeBytes { NSData(bytes: $0.baseAddress, length: $0.count) }
 
-        for byte in bytes {
-            expectEqual(data[Int(byte)], byte)
+            for byte in bytes {
+                expectEqual(data[Int(byte)], byte)
+            }
         }
     }
 
     func test_dispatchSequence() {
-        let bytes1: [UInt8] = Array(0x00..<0xF0)
-        let bytes2: [UInt8] = Array(0xF0..<0xFF)
-        var data = DispatchData.empty
-        bytes1.withUnsafeBytes {
-            data.append($0)
+        if #available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *) {
+            let bytes1: [UInt8] = Array(0x00..<0xF0)
+            let bytes2: [UInt8] = Array(0xF0..<0xFF)
+            var data = DispatchData.empty
+            bytes1.withUnsafeBytes {
+                data.append($0)
+            }
+            bytes2.withUnsafeBytes {
+                data.append($0)
+            }
+
+            for byte in bytes1 {
+                expectEqual(data[Int(byte)], byte)
+            }
+            for byte in bytes2 {
+                expectEqual(data[Int(byte)], byte)
+            }
         }
-        bytes2.withUnsafeBytes {
-            data.append($0)
+    }
+
+    func test_increaseCount() {
+        guard #available(macOS 10.16, iOS 14.0, watchOS 7.0, tvOS 14.0, *) else { return }
+        let initials: [Range<UInt8>] = [
+            0..<0,
+            0..<2,
+            0..<4,
+            0..<8,
+            0..<16,
+            0..<32,
+            0..<64
+        ]
+        let diffs = [0, 1, 2, 4, 8, 16, 32]
+        for initial in initials {
+            for diff in diffs {
+                var data = Data(initial)
+                data.count += diff
+                expectEqualSequence(
+                    Array(initial) + Array(repeating: 0, count: diff),
+                    data)
+            }
+        }
+    }
+
+    func test_decreaseCount() {
+        guard #available(macOS 10.16, iOS 14.0, watchOS 7.0, tvOS 14.0, *) else { return }
+        let initials: [Range<UInt8>] = [
+            0..<0,
+            0..<2,
+            0..<4,
+            0..<8,
+            0..<16,
+            0..<32,
+            0..<64
+        ]
+        let diffs = [0, 1, 2, 4, 8, 16, 32]
+        for initial in initials {
+            for diff in diffs {
+                guard initial.count >= diff else { continue }
+                var data = Data(initial)
+                data.count -= diff
+                expectEqualSequence(
+                    initial.dropLast(diff),
+                    data)
+            }
+        }
+    }
+
+    // This is a (potentially invalid) sequence that produces a configurable number of 42s and has a freely customizable `underestimatedCount`.
+    struct TestSequence: Sequence {
+        typealias Element = UInt8
+        struct Iterator: IteratorProtocol {
+            var _remaining: Int
+            init(_ count: Int) {
+                _remaining = count
+            }
+            mutating func next() -> UInt8? {
+                guard _remaining > 0 else { return nil }
+                _remaining -= 1
+                return 42
+            }
+        }
+        let underestimatedCount: Int
+        let count: Int
+
+        func makeIterator() -> Iterator {
+            return Iterator(count)
+        }
+    }
+
+    func test_init_TestSequence() {
+        // Underestimated count
+        do {
+            let d = Data(TestSequence(underestimatedCount: 0, count: 10))
+            expectEqual(10, d.count)
+            expectEqual(Array(repeating: 42 as UInt8, count: 10), Array(d))
         }
 
-        for byte in bytes1 {
-            expectEqual(data[Int(byte)], byte)
+        // Very underestimated count (to exercise realloc path)
+        do {
+            let d = Data(TestSequence(underestimatedCount: 0, count: 1000))
+            expectEqual(1000, d.count)
+            expectEqual(Array(repeating: 42 as UInt8, count: 1000), Array(d))
         }
-        for byte in bytes2 {
-            expectEqual(data[Int(byte)], byte)
+
+        // Exact count
+        do {
+            let d = Data(TestSequence(underestimatedCount: 10, count: 10))
+            expectEqual(10, d.count)
+            expectEqual(Array(repeating: 42 as UInt8, count: 10), Array(d))
+        }
+
+        // Overestimated count. This is an illegal case, so trapping would be fine.
+        // However, for compatibility with the implementation in Swift 5, Data
+        // handles this case by simply truncating itself to the actual size.
+        do {
+            let d = Data(TestSequence(underestimatedCount: 20, count: 10))
+            expectEqual(10, d.count)
+            expectEqual(Array(repeating: 42 as UInt8, count: 10), Array(d))
+        }
+    }
+
+    func test_append_TestSequence() {
+        let base = Data(Array(repeating: 23 as UInt8, count: 10))
+
+        // Underestimated count
+        do {
+            var d = base
+            d.append(contentsOf: TestSequence(underestimatedCount: 0, count: 10))
+            expectEqual(20, d.count)
+            expectEqual(Array(base) + Array(repeating: 42 as UInt8, count: 10),
+                           Array(d))
+        }
+
+        // Very underestimated count (to exercise realloc path)
+        do {
+            var d = base
+            d.append(contentsOf: TestSequence(underestimatedCount: 0, count: 1000))
+            expectEqual(1010, d.count)
+            expectEqual(Array(base) + Array(repeating: 42 as UInt8, count: 1000), Array(d))
+        }
+
+        // Exact count
+        do {
+            var d = base
+            d.append(contentsOf: TestSequence(underestimatedCount: 10, count: 10))
+            expectEqual(20, d.count)
+            expectEqual(Array(base) + Array(repeating: 42 as UInt8, count: 10), Array(d))
+        }
+
+        // Overestimated count. This is an illegal case, so trapping would be fine.
+        // However, for compatibility with the implementation in Swift 5, Data
+        // handles this case by simply truncating itself to the actual size.
+        do {
+            var d = base
+            d.append(contentsOf: TestSequence(underestimatedCount: 20, count: 10))
+            expectEqual(20, d.count)
+            expectEqual(Array(base) + Array(repeating: 42 as UInt8, count: 10), Array(d))
         }
     }
 }
@@ -4151,8 +4295,14 @@ DataTests.test("test_validateMutation_slice_customBacking_withUnsafeMutableBytes
 DataTests.test("test_validateMutation_slice_customMutableBacking_withUnsafeMutableBytes_lengthLessThanLowerBound") { TestData().test_validateMutation_slice_customMutableBacking_withUnsafeMutableBytes_lengthLessThanLowerBound() }
 DataTests.test("test_byte_access_of_discontiguousData") { TestData().test_byte_access_of_discontiguousData() }
 DataTests.test("test_rangeOfSlice") { TestData().test_rangeOfSlice() }
-DataTests.test("test_nsdataSequence") { TestData().test_nsdataSequence() }
-DataTests.test("test_dispatchSequence") { TestData().test_dispatchSequence() }
+if #available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *) {
+    DataTests.test("test_nsdataSequence") { TestData().test_nsdataSequence() }
+    DataTests.test("test_dispatchSequence") { TestData().test_dispatchSequence() }
+}
+DataTests.test("test_increaseCount") { TestData().test_increaseCount() }
+DataTests.test("test_decreaseCount") { TestData().test_decreaseCount() }
+DataTests.test("test_increaseCount") { TestData().test_init_TestSequence() }
+DataTests.test("test_decreaseCount") { TestData().test_append_TestSequence() }
 
 
 // XCTest does not have a crash detection, whereas lit does
@@ -4223,4 +4373,3 @@ DataTests.test("bounding failure subscript") {
 
 runAllTests()
 #endif
-

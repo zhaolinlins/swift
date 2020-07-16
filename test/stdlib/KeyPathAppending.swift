@@ -50,31 +50,36 @@ func mismatchedAppends<T, U, V>(readOnlyLeft: KeyPath<T, U>,
                                 writableRight: WritableKeyPath<U, V>,
                                 referenceRight: ReferenceWritableKeyPath<U, V>){
   _ = readOnlyRight.appending(path: readOnlyLeft)
-  // expected-error@-1 {{referencing instance method 'appending(path:)' on '_AppendKeyPath' requires the types 'KeyPath<U, V>' and 'AnyKeyPath' be equivalent}}
+  // expected-error@-1 {{cannot convert value of type 'KeyPath<T, U>' to expected argument type 'KeyPath<V, U>'}}
+  // expected-note@-2 {{arguments to generic parameter 'Root' ('T' and 'V') are expected to be equal}}
 
   _ = readOnlyRight.appending(path: writableLeft)
-  // expected-error@-1 {{referencing instance method 'appending(path:)' on '_AppendKeyPath' requires the types 'KeyPath<U, V>' and 'AnyKeyPath' be equivalent}}
+  // expected-error@-1 {{cannot convert value of type 'KeyPath<T, U>' to expected argument type 'KeyPath<V, U>'}}
+  // expected-note@-2 {{arguments to generic parameter 'Root' ('T' and 'V') are expected to be equal}}
 
   _ = readOnlyRight.appending(path: referenceLeft)
-  // expected-error@-1 {{referencing instance method 'appending(path:)' on '_AppendKeyPath' requires the types 'KeyPath<U, V>' and 'AnyKeyPath' be equivalent}}
+  // expected-error@-1 {{no exact matches in call to instance method 'appending'}}
 
   _ = writableRight.appending(path: readOnlyLeft)
-  // expected-error@-1 {{referencing instance method 'appending(path:)' on '_AppendKeyPath' requires the types 'WritableKeyPath<U, V>' and 'AnyKeyPath' be equivalent}}
+  // expected-error@-1 {{no exact matches in call to instance method 'appending'}}
 
   _ = writableRight.appending(path: writableLeft)
-  // expected-error@-1 {{referencing instance method 'appending(path:)' on '_AppendKeyPath' requires the types 'WritableKeyPath<U, V>' and 'AnyKeyPath' be equivalent}}
+  // expected-error@-1 {{cannot convert value of type 'WritableKeyPath<T, U>' to expected argument type 'WritableKeyPath<V, U>'}}
+  // expected-note@-2 {{arguments to generic parameter 'Root' ('T' and 'V') are expected to be equal}}
 
   _ = writableRight.appending(path: referenceLeft)
-  // expected-error@-1 {{referencing instance method 'appending(path:)' on '_AppendKeyPath' requires the types 'WritableKeyPath<U, V>' and 'AnyKeyPath' be equivalent}}
+  // expected-error@-1 {{no exact matches in call to instance method 'appending'}}
 
   _ = referenceRight.appending(path: readOnlyLeft)
-  // expected-error@-1 {{referencing instance method 'appending(path:)' on '_AppendKeyPath' requires the types 'ReferenceWritableKeyPath<U, V>' and 'AnyKeyPath' be equivalent}}
+  // expected-error@-1 {{no exact matches in call to instance method 'appending'}}
 
   _ = referenceRight.appending(path: writableLeft)
-  // expected-error@-1 {{referencing instance method 'appending(path:)' on '_AppendKeyPath' requires the types 'ReferenceWritableKeyPath<U, V>' and 'AnyKeyPath' be equivalent}}
+  // expected-error@-1 {{cannot convert value of type 'WritableKeyPath<T, U>' to expected argument type 'WritableKeyPath<V, U>'}}
+  // expected-note@-2 {{arguments to generic parameter 'Root' ('T' and 'V') are expected to be equal}}
 
   _ = referenceRight.appending(path: referenceLeft)
-  // expected-error@-1 {{referencing instance method 'appending(path:)' on '_AppendKeyPath' requires the types 'ReferenceWritableKeyPath<U, V>' and 'AnyKeyPath' be equivalent}}
+  // expected-error@-1 {{cannot convert value of type 'WritableKeyPath<T, U>' to expected argument type 'WritableKeyPath<V, U>'}}
+  // expected-note@-2 {{arguments to generic parameter 'Root' ('T' and 'V') are expected to be equal}}
 }
 
 func partialAppends<T, U, V>(partial: PartialKeyPath<T>,

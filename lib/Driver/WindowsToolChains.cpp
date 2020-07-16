@@ -52,6 +52,12 @@ toolchains::Windows::constructInvocation(const DynamicLinkJobAction &job,
 
   ArgStringList Arguments;
 
+  std::string Target = getTriple().str();
+  if (!Target.empty()) {
+    Arguments.push_back("-target");
+    Arguments.push_back(context.Args.MakeArgString(Target));
+  }
+
   switch (job.getKind()) {
   case LinkKind::None:
     llvm_unreachable("invalid link kind");
@@ -78,27 +84,9 @@ toolchains::Windows::constructInvocation(const DynamicLinkJobAction &job,
       Arguments.push_back("/DEBUG");
   }
 
-  // Configure the toolchain.
-  // By default, use the system clang++ to link.
-  const char *Clang = "clang++";
-  if (const Arg *A = context.Args.getLastArg(options::OPT_tools_directory)) {
-    StringRef toolchainPath(A->getValue());
-
-    // If there is a clang in the toolchain folder, use that instead.
-    if (auto toolchainClang =
-            llvm::sys::findProgramByName("clang++", {toolchainPath}))
-      Clang = context.Args.MakeArgString(toolchainClang.get());
-  }
-
-  std::string Target = getTriple().str();
-  if (!Target.empty()) {
-    Arguments.push_back("-target");
-    Arguments.push_back(context.Args.MakeArgString(Target));
-  }
-
   // Rely on `-libc` to correctly identify the MSVC Runtime Library.  We use
   // `-nostartfiles` as that limits the difference to just the
-  // `-defaultlib:libcmt` which is passed unconditionally with the `clang++`
+  // `-defaultlib:libcmt` which is passed unconditionally with the `clang`
   // driver rather than the `clang-cl` driver.
   Arguments.push_back("-nostartfiles");
 
@@ -145,6 +133,13 @@ toolchains::Windows::constructInvocation(const DynamicLinkJobAction &job,
     Arguments.push_back(context.Args.MakeArgString(context.OI.SDKPath));
   }
 
+  // Link against the desired C++ standard library.
+  if (const Arg *A =
+      context.Args.getLastArg(options::OPT_experimental_cxx_stdlib)) {
+    Arguments.push_back(context.Args.MakeArgString(
+        Twine("-stdlib=") + A->getValue()));
+  }
+
   if (job.getKind() == LinkKind::Executable) {
     if (context.OI.SelectedSanitizers & SanitizerKind::Address)
       addLinkRuntimeLib(context.Args, Arguments,
@@ -172,7 +167,7 @@ toolchains::Windows::constructInvocation(const DynamicLinkJobAction &job,
   context.Args.AddAllArgs(Arguments, options::OPT_linker_option_Group);
   context.Args.AddAllArgValues(Arguments, options::OPT_Xclang_linker);
 
-  // Run clang++ in verbose mode if "-v" is set
+  // Run clang in verbose mode if "-v" is set
   if (context.Args.hasArg(options::OPT_v)) {
     Arguments.push_back("-v");
   }
@@ -182,7 +177,7 @@ toolchains::Windows::constructInvocation(const DynamicLinkJobAction &job,
   Arguments.push_back(
       context.Args.MakeArgString(context.Output.getPrimaryOutputFilename()));
 
-  InvocationInfo II{Clang, Arguments};
+  InvocationInfo II{getClangLinkerDriver(context.Args), Arguments};
   II.allowsResponseFiles = true;
 
   return II;

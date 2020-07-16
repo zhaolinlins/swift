@@ -17,29 +17,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#if !(defined(DIAG) || (defined(ERROR) && defined(WARNING) && defined(NOTE) && defined(REMARK)))
-#  error Must define either DIAG or the set {ERROR,WARNING,NOTE,REMARK}
-#endif
-
-#ifndef ERROR
-#  define ERROR(ID,Options,Text,Signature)   \
-  DIAG(ERROR,ID,Options,Text,Signature)
-#endif
-
-#ifndef WARNING
-#  define WARNING(ID,Options,Text,Signature) \
-  DIAG(WARNING,ID,Options,Text,Signature)
-#endif
-
-#ifndef NOTE
-#  define NOTE(ID,Options,Text,Signature) \
-  DIAG(NOTE,ID,Options,Text,Signature)
-#endif
-
-#ifndef REMARK
-#  define REMARK(ID,Options,Text,Signature) \
-  DIAG(REMARK,ID,Options,Text,Signature)
-#endif
+#define DEFINE_DIAGNOSTIC_MACROS
+#include "DefineDiagnosticMacros.h"
 
 ERROR(invalid_diagnostic,none,
       "INTERNAL ERROR: this diagnostic should not be produced", ())
@@ -111,6 +90,10 @@ ERROR(attr_only_on_parameters, none,
 ERROR(function_type_no_parens,none,
       "single argument function types require parentheses", ())
 
+// Used by both the Frontend and Sema.
+ERROR(error_underlying_module_not_found,none,
+      "underlying Objective-C module %0 not found", (Identifier))
+
 // Used by -verify-generic-signatures
 ERROR(generic_signature_not_minimal,none,
       "generic requirement '%0' is redundant in %1", (StringRef, StringRef))
@@ -135,14 +118,19 @@ ERROR(sdk_node_unrecognized_decl_kind,none,
 ERROR(sdk_node_unrecognized_accessor_kind,none,
       "unrecognized accessor kind '%0' in SDK node", (StringRef))
 
+// Emitted from ModuleDecl::computeMagicFileStringMap()
+WARNING(pound_source_location_creates_pound_file_conflicts,none,
+        "'#sourceLocation' directive produces '#file' string of '%0', which "
+        "conflicts with '#file' strings produced by other paths in the module",
+        (StringRef))
+NOTE(fixit_correct_source_location_file,none,
+     "change file in '#sourceLocation' to '%0'", (StringRef))
+
 //------------------------------------------------------------------------------
 // MARK: Circular reference diagnostics
 //------------------------------------------------------------------------------
 ERROR(circular_reference, none,
       "circular reference", ())
-
-ERROR(redundant_type_alias_define, none,
-      "redundant type alias declaration", ())
 
 NOTE(circular_reference_through, none,
      "through reference here", ())
@@ -159,11 +147,28 @@ ERROR(circular_protocol_def,none,
 NOTE(kind_declname_declared_here,none,
      "%0 %1 declared here", (DescriptiveDeclKind, DeclName))
 
-#ifndef DIAG_NO_UNDEF
-# if defined(DIAG)
-#  undef DIAG
-# endif
-# undef NOTE
-# undef WARNING
-# undef ERROR
-#endif
+WARNING(warn_property_wrapper_module_scope,none,
+        "ignoring associated type %0 in favor of module-scoped property "
+        "wrapper %0; please qualify the reference with %1",
+        (DeclNameRef, Identifier))
+
+NOTE(circular_type_resolution_note,none,
+     "while resolving type %0", (TypeRepr *))
+
+//------------------------------------------------------------------------------
+// MARK: Cross-import overlay loading diagnostics
+//------------------------------------------------------------------------------
+ERROR(cannot_load_swiftoverlay_file, none,
+      "cannot load cross-import overlay for '%0' and '%1': %2 (declared by '%3')",
+      (StringRef, StringRef, StringRef, StringRef))
+ERROR(cannot_list_swiftcrossimport_dir, none,
+      "cannot list cross-import overlays for '%0': %1 (declared in '%2')",
+      (StringRef, StringRef, StringRef))
+WARNING(cross_imported_by_both_modules, none,
+        "modules %0 and %1 both declare module %2 as a cross-import overlay, "
+        "which may cause paradoxical behavior when looking up names in them; "
+        "please report this bug to the maintainers of these modules",
+        (Identifier, Identifier, Identifier))
+
+#define UNDEFINE_DIAGNOSTIC_MACROS
+#include "DefineDiagnosticMacros.h"

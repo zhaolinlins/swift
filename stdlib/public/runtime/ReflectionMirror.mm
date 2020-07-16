@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2018 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2020 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -23,7 +23,6 @@
 #include "swift/Runtime/Portability.h"
 #include "Private.h"
 #include "WeakReference.h"
-#include "llvm/Support/Compiler.h"
 #include <cassert>
 #include <cinttypes>
 #include <cstdio>
@@ -57,6 +56,7 @@ int asprintf(char **strp, const char *fmt, ...) {
     return -1;
 
   length = _vsnprintf(*strp, length, fmt, argp1);
+  (*strp)[length] = '\0';
 
   va_end(argp0);
   va_end(argp1);
@@ -88,6 +88,29 @@ using namespace swift;
 #endif
 
 namespace {
+
+class FieldType {
+  const Metadata *type;
+  bool indirect;
+  TypeReferenceOwnership referenceOwnership;
+public:
+
+  constexpr FieldType() : type(nullptr), indirect(false), referenceOwnership() { }
+  constexpr FieldType(const Metadata *T) : type(T), indirect(false), referenceOwnership() { }
+
+  static constexpr FieldType untypedEnumCase(bool indirect) {
+    FieldType type{};
+    type.indirect = indirect;
+    return type;
+  }
+  const Metadata *getType() const { return type; }
+  const TypeReferenceOwnership getReferenceOwnership() const { return referenceOwnership; }
+  bool isIndirect() const { return indirect; }
+  void setIndirect(bool value) { indirect = value; }
+  void setReferenceOwnership(TypeReferenceOwnership newOwnership) {
+    referenceOwnership = newOwnership;
+  }
+};
 
 /// The layout of Any.
 using Any = OpaqueExistentialContainer;
@@ -123,58 +146,63 @@ unwrapExistential(const Metadata *T, OpaqueValue *Value) {
   return std::make_tuple(T, Value);
 }
 
-static bool loadSpecialReferenceStorage(OpaqueValue *fieldData,
-                                        const FieldType fieldType,
-                                        Any *outValue) {
-  // isWeak() implies a reference type via Sema.
-  if (!fieldType.isWeak())
-    return false;
-
-  auto type = fieldType.getType();
+static void copyWeakFieldContents(OpaqueValue *destContainer, const Metadata *type, OpaqueValue *fieldData) {
   assert(type->getKind() == MetadataKind::Optional);
+  auto *srcContainer = reinterpret_cast<WeakClassExistentialContainer*>(fieldData);
+  auto *destClassContainer = reinterpret_cast<ClassExistentialContainer*>(destContainer);
+  destClassContainer->Value = swift_unknownObjectWeakLoadStrong(&srcContainer->Value);
+  auto witnessTablesSize = type->vw_size() - sizeof(WeakClassExistentialContainer);
+  memcpy(destClassContainer->getWitnessTables(), srcContainer->getWitnessTables(), witnessTablesSize);
+}
 
-  auto *weakField = reinterpret_cast<WeakReference *>(fieldData);
-  auto *strongValue = swift_unknownObjectWeakLoadStrong(weakField);
+static void copyUnownedFieldContents(OpaqueValue *destContainer, const Metadata *type, OpaqueValue *fieldData) {
+  auto *srcContainer = reinterpret_cast<UnownedClassExistentialContainer*>(fieldData);
+  auto *destClassContainer = reinterpret_cast<ClassExistentialContainer*>(destContainer);
+  destClassContainer->Value = swift_unknownObjectUnownedLoadStrong(&srcContainer->Value);
+  auto witnessTablesSize = type->vw_size() - sizeof(UnownedClassExistentialContainer);
+  memcpy(destClassContainer->getWitnessTables(), srcContainer->getWitnessTables(), witnessTablesSize);
+}
 
-  // Now that we have a strong reference, we need to create a temporary buffer
-  // from which to copy the whole value, which might be a native class-bound
-  // existential, which means we also need to copy n witness tables, for
-  // however many protocols are in the protocol composition. For example, if we
-  // are copying a:
-  // weak var myWeakProperty : (Protocol1 & Protocol2)?
-  // then we need to copy three values:
-  // - the instance
-  // - the witness table for Protocol1
-  // - the witness table for Protocol2
+static void copyUnmanagedFieldContents(OpaqueValue *destContainer, const Metadata *type, OpaqueValue *fieldData) {
+  // Also known as "unowned(unsafe)".
+  // This is simpler than the unowned/weak cases because unmanaged
+  // references are fundamentally the same as strong ones, so we
+  // can use the regular strong reference support that already
+  // knows how to handle existentials and Obj-C references.
+  type->vw_initializeWithCopy(destContainer, fieldData);
+}
 
-  auto *weakContainer =
-    reinterpret_cast<WeakClassExistentialContainer *>(fieldData);
+static AnyReturn copyFieldContents(OpaqueValue *fieldData,
+                                        const FieldType fieldType) {
+  Any outValue;
+  auto *type = fieldType.getType();
+  outValue.Type = type;
+  auto ownership = fieldType.getReferenceOwnership();
+  auto *destContainer = type->allocateBoxForExistentialIn(&outValue.Buffer);
 
-  // Create a temporary existential where we can put the strong reference.
-  // The allocateBuffer value witness requires a ValueBuffer to own the
-  // allocated storage.
-  ValueBuffer temporaryBuffer;
+  if (ownership.isStrong()) {
+    type->vw_initializeWithCopy(destContainer, fieldData);
+  }
 
-  auto *temporaryValue = reinterpret_cast<ClassExistentialContainer *>(
-      type->allocateBufferIn(&temporaryBuffer));
+  // Generate a conditional clause for every known ownership type.
+  // If this causes errors, it's because someone added a new ownership type
+  // to ReferenceStorage.def and missed some related updates.
+#define REF_STORAGE(Name, ...) \
+  else if (ownership.is##Name()) { \
+    copy##Name##FieldContents(destContainer, type, fieldData); \
+  }
+#include "swift/AST/ReferenceStorage.def"
 
-  // Now copy the entire value out of the parent, which will include the
-  // witness tables.
-  temporaryValue->Value = strongValue;
-  auto valueWitnessesSize = type->getValueWitnesses()->getSize() -
-                            sizeof(WeakClassExistentialContainer);
-  memcpy(temporaryValue->getWitnessTables(), weakContainer->getWitnessTables(),
-         valueWitnessesSize);
+  else {
+    // The field was declared with a reference type we don't understand.
+    warning(0, "Value with unrecognized reference type is reflected as ()");
+    // Clean up the buffer allocated above
+    type->deallocateBoxForExistentialIn(&outValue.Buffer);
+    // Return an existential containing Void
+    outValue.Type = &METADATA_SYM(EMPTY_TUPLE_MANGLING);
+  }
 
-  outValue->Type = type;
-  auto *opaqueValueAddr = type->allocateBoxForExistentialIn(&outValue->Buffer);
-  type->vw_initializeWithCopy(opaqueValueAddr,
-                              reinterpret_cast<OpaqueValue *>(temporaryValue));
-
-  type->deallocateBufferIn(&temporaryBuffer);
-  swift_unknownObjectRelease(strongValue);
-  
-  return true;
+  return AnyReturn(outValue);
 }
 
 
@@ -185,6 +213,10 @@ struct ReflectionMirrorImpl {
   
   virtual char displayStyle() = 0;
   virtual intptr_t count() = 0;
+  virtual intptr_t childOffset(intptr_t index) = 0;
+  virtual const FieldType childMetadata(intptr_t index,
+                                        const char **outName,
+                                        void (**outFreeFunc)(const char *)) = 0;
   virtual AnyReturn subscript(intptr_t index, const char **outName,
                               void (**outFreeFunc)(const char *)) = 0;
   virtual const char *enumCaseName() { return nullptr; }
@@ -193,6 +225,22 @@ struct ReflectionMirrorImpl {
   virtual id quickLookObject() { return nil; }
 #endif
   
+  // For class types, traverse through superclasses when providing field
+  // information. The base implementations call through to their local-only
+  // counterparts.
+  virtual intptr_t recursiveCount() {
+    return count();
+  }
+  virtual intptr_t recursiveChildOffset(intptr_t index) {
+    return childOffset(index);
+  }
+  virtual const FieldType recursiveChildMetadata(intptr_t index,
+                                                 const char **outName,
+                                                 void (**outFreeFunc)(const char *))
+  {
+    return childMetadata(index, outName, outFreeFunc);
+  }
+
   virtual ~ReflectionMirrorImpl() {}
 };
 
@@ -208,8 +256,19 @@ struct TupleImpl : ReflectionMirrorImpl {
     return Tuple->NumElements;
   }
   
-  AnyReturn subscript(intptr_t i, const char **outName,
-                      void (**outFreeFunc)(const char *)) {
+  intptr_t childOffset(intptr_t i) {
+    auto *Tuple = static_cast<const TupleTypeMetadata *>(type);
+
+    if (i < 0 || (size_t)i > Tuple->NumElements)
+      swift::crash("Swift mirror subscript bounds check failure");
+
+    // Get the nth element.
+    auto &elt = Tuple->getElement(i);
+    return elt.Offset;
+  }
+
+  const FieldType childMetadata(intptr_t i, const char **outName,
+                                void (**outFreeFunc)(const char *)) {
     auto *Tuple = static_cast<const TupleTypeMetadata *>(type);
 
     if (i < 0 || (size_t)i > Tuple->NumElements)
@@ -242,12 +301,21 @@ struct TupleImpl : ReflectionMirrorImpl {
 
     // Get the nth element.
     auto &elt = Tuple->getElement(i);
+
+    return FieldType(elt.Type);
+  }
+
+  AnyReturn subscript(intptr_t i, const char **outName,
+                      void (**outFreeFunc)(const char *)) {
+    auto eltOffset = childOffset(i);
+    auto fieldType = childMetadata(i, outName, outFreeFunc);
+
     auto *bytes = reinterpret_cast<const char *>(value);
-    auto *eltData = reinterpret_cast<const OpaqueValue *>(bytes + elt.Offset);
+    auto *eltData = reinterpret_cast<const OpaqueValue *>(bytes + eltOffset);
 
     Any result;
 
-    result.Type = elt.Type;
+    result.Type = fieldType.getType();
     auto *opaqueValueAddr = result.Type->allocateBoxForExistentialIn(&result.Buffer);
     result.Type->vw_initializeWithCopy(opaqueValueAddr,
                                        const_cast<OpaqueValue *>(eltData));
@@ -310,11 +378,7 @@ getFieldAt(const Metadata *base, unsigned index) {
       "type '%*s' that claims to be reflectable. Its fields will show up as "
       "'unknown' in Mirrors\n",
       (int)typeName.length, typeName.data);
-    return {"unknown",
-            FieldType()
-              .withType(&METADATA_SYM(EMPTY_TUPLE_MANGLING))
-              .withIndirect(false)
-              .withWeak(false)};
+    return {"unknown", FieldType(&METADATA_SYM(EMPTY_TUPLE_MANGLING))};
   };
 
   auto *baseDesc = base->getTypeContextDescriptor();
@@ -325,16 +389,15 @@ getFieldAt(const Metadata *base, unsigned index) {
   if (!fields)
     return failedToFindMetadata();
   
-  const FieldDescriptor &descriptor = *fields;
-  auto &field = descriptor.getFields()[index];
+  auto &field = fields->getFields()[index];
   // Bounds are always valid as the offset is constant.
-  auto name = field.getFieldName(0, 0, std::numeric_limits<uintptr_t>::max());
+  auto name = field.getFieldName();
 
   // Enum cases don't always have types.
   if (!field.hasMangledTypeName())
-    return {name, FieldType().withIndirect(field.isIndirectCase())};
+    return {name, FieldType::untypedEnumCase(field.isIndirectCase())};
 
-  auto typeName = field.getMangledTypeName(0);
+  auto typeName = field.getMangledTypeName();
 
   SubstGenericParametersFromMetadata substitutions(base);
   auto typeInfo = swift_getTypeByMangledName(MetadataState::Complete,
@@ -360,10 +423,10 @@ getFieldAt(const Metadata *base, unsigned index) {
       (int)typeName.size(), typeName.data());
   }
 
-  return {name, FieldType()
-                 .withType(typeInfo.getMetadata())
-                 .withIndirect(field.isIndirectCase())
-                 .withWeak(typeInfo.isWeak())};
+  auto fieldType = FieldType(typeInfo.getMetadata());
+  fieldType.setIndirect(field.isIndirectCase());
+  fieldType.setReferenceOwnership(typeInfo.getReferenceOwnership());
+  return {name, fieldType};
 }
 
 // Implementation for structs.
@@ -386,18 +449,19 @@ struct StructImpl : ReflectionMirrorImpl {
     auto *Struct = static_cast<const StructMetadata *>(type);
     return Struct->getDescription()->NumFields;
   }
-  
-  AnyReturn subscript(intptr_t i, const char **outName,
-                      void (**outFreeFunc)(const char *)) {
+
+  intptr_t childOffset(intptr_t i) {
     auto *Struct = static_cast<const StructMetadata *>(type);
 
     if (i < 0 || (size_t)i > Struct->getDescription()->NumFields)
       swift::crash("Swift mirror subscript bounds check failure");
 
     // Load the offset from its respective vector.
-    auto fieldOffset = Struct->getFieldOffsets()[i];
+    return Struct->getFieldOffsets()[i];
+  }
 
-    Any result;
+  const FieldType childMetadata(intptr_t i, const char **outName,
+                                void (**outFreeFunc)(const char *)) {
     StringRef name;
     FieldType fieldInfo;
     std::tie(name, fieldInfo) = getFieldAt(type, i);
@@ -406,18 +470,18 @@ struct StructImpl : ReflectionMirrorImpl {
     *outName = name.data();
     *outFreeFunc = nullptr;
     
-    auto *bytes = reinterpret_cast<char*>(value);
-    auto *fieldData = reinterpret_cast<OpaqueValue *>(bytes + fieldOffset);
-    
-    bool didLoad = loadSpecialReferenceStorage(fieldData, fieldInfo, &result);
-    if (!didLoad) {
-      result.Type = fieldInfo.getType();
-      auto *opaqueValueAddr = result.Type->allocateBoxForExistentialIn(&result.Buffer);
-      result.Type->vw_initializeWithCopy(opaqueValueAddr,
-                                         const_cast<OpaqueValue *>(fieldData));
-    }
+    return fieldInfo;
+  }
 
-    return AnyReturn(result);
+  AnyReturn subscript(intptr_t i, const char **outName,
+                      void (**outFreeFunc)(const char *)) {
+    auto fieldInfo = childMetadata(i, outName, outFreeFunc);
+
+    auto *bytes = reinterpret_cast<char*>(value);
+    auto fieldOffset = childOffset(i);
+    auto *fieldData = reinterpret_cast<OpaqueValue *>(bytes + fieldOffset);
+
+    return copyFieldContents(fieldData, fieldInfo);
   }
 };
 
@@ -461,9 +525,23 @@ struct EnumImpl : ReflectionMirrorImpl {
       return 0;
     }
     
+    // No fields if reflecting the enumeration type instead of a case
+    if (!value) {
+      return 0;
+    }
+
     const Metadata *payloadType;
     getInfo(nullptr, &payloadType, nullptr);
     return (payloadType != nullptr) ? 1 : 0;
+  }
+
+  intptr_t childOffset(intptr_t i) {
+    return 0;
+  }
+
+  const FieldType childMetadata(intptr_t i, const char **outName,
+                                void (**outFreeFunc)(const char *)) {
+    return FieldType();
   }
 
   AnyReturn subscript(intptr_t i, const char **outName,
@@ -474,14 +552,21 @@ struct EnumImpl : ReflectionMirrorImpl {
 
     auto *caseName = getInfo(&tag, &payloadType, &indirect);
 
+    // Copy the enum itself so that we can project the data without destroying
+    // the original.
+    Any enumCopy;
+    auto *enumCopyContainer
+      = type->allocateBoxForExistentialIn(&enumCopy.Buffer);
+    type->vw_initializeWithCopy(enumCopyContainer,
+                                const_cast<OpaqueValue *>(value));
+
     // Copy the enum payload into a box
     const Metadata *boxType = (indirect ? &METADATA_SYM(Bo).base : payloadType);
     BoxPair pair = swift_allocBox(boxType);
-
-    type->vw_destructiveProjectEnumData(const_cast<OpaqueValue *>(value));
-    boxType->vw_initializeWithCopy(pair.buffer, const_cast<OpaqueValue *>(value));
-    type->vw_destructiveInjectEnumTag(const_cast<OpaqueValue *>(value), tag);
-
+    type->vw_destructiveProjectEnumData(enumCopyContainer);
+    boxType->vw_initializeWithTake(pair.buffer, enumCopyContainer);
+    type->deallocateBoxForExistentialIn(&enumCopy.Buffer);
+    
     value = pair.buffer;
 
     // If the payload is indirect, we need to jump through the box to get it.
@@ -526,21 +611,54 @@ struct ClassImpl : ReflectionMirrorImpl {
     return 'c';
   }
   
+  bool hasSuperclassMirror() {
+    auto *Clas = static_cast<const ClassMetadata*>(type);
+    auto description = Clas->getDescription();
+
+    return ((description->SuperclassType)
+            && (Clas->Superclass)
+            && (Clas->Superclass->isTypeMetadata()));
+  }
+
+  ClassImpl superclassMirror() {
+    auto *Clas = static_cast<const ClassMetadata*>(type);
+    auto description = Clas->getDescription();
+
+    if (description->SuperclassType) {
+      if (auto theSuperclass = Clas->Superclass) {
+        auto impl = ClassImpl();
+        impl.type = (Metadata *)theSuperclass;
+        impl.value = nullptr;
+        return impl;
+      }
+    }
+    swift::crash("No superclass mirror found");
+  }
+
   intptr_t count() {
     if (!isReflectable())
       return 0;
 
     auto *Clas = static_cast<const ClassMetadata*>(type);
-    auto count = Clas->getDescription()->NumFields;
+    auto description = Clas->getDescription();
+    auto count = description->NumFields;
 
     return count;
   }
-  
-  AnyReturn subscript(intptr_t i, const char **outName,
-                      void (**outFreeFunc)(const char *)) {
-    auto *Clas = static_cast<const ClassMetadata*>(type);
 
-    if (i < 0 || (size_t)i > Clas->getDescription()->NumFields)
+  intptr_t recursiveCount() {
+    if (hasSuperclassMirror()) {
+      return superclassMirror().recursiveCount() + count();
+    }
+
+    return count();
+  }
+
+  intptr_t childOffset(intptr_t i) {
+    auto *Clas = static_cast<const ClassMetadata*>(type);
+    auto description = Clas->getDescription();
+
+    if (i < 0 || (size_t)i > description->NumFields)
       swift::crash("Swift mirror subscript bounds check failure");
 
     // FIXME: If the class has ObjC heritage, get the field offset using the ObjC
@@ -558,28 +676,64 @@ struct ClassImpl : ReflectionMirrorImpl {
       swift::crash("Object appears to be Objective-C, but no runtime.");
   #endif
     }
+    return (intptr_t)fieldOffset;
+  }
 
-    Any result;
+  intptr_t recursiveChildOffset(intptr_t i) {
+    if (hasSuperclassMirror()) {
+      auto superMirror = superclassMirror();
+      auto superclassFieldCount = superMirror.recursiveCount();
+
+      if (i < superclassFieldCount) {
+        return superMirror.recursiveChildOffset(i);
+      } else {
+        i -= superclassFieldCount;
+      }
+    }
+
+    return childOffset(i);
+  }
+
+  const FieldType childMetadata(intptr_t i, const char **outName,
+                                void (**outFreeFunc)(const char *)) {
     StringRef name;
     FieldType fieldInfo;
     std::tie(name, fieldInfo) = getFieldAt(type, i);
     assert(!fieldInfo.isIndirect() && "class indirect properties not implemented");
-    
-    auto *bytes = *reinterpret_cast<char * const *>(value);
-    auto *fieldData = reinterpret_cast<OpaqueValue *>(bytes + fieldOffset);
 
     *outName = name.data();
     *outFreeFunc = nullptr;
-  
-    bool didLoad = loadSpecialReferenceStorage(fieldData, fieldInfo, &result);
-    if (!didLoad) {
-      result.Type = fieldInfo.getType();
-      auto *opaqueValueAddr = result.Type->allocateBoxForExistentialIn(&result.Buffer);
-      result.Type->vw_initializeWithCopy(opaqueValueAddr,
-                                         const_cast<OpaqueValue *>(fieldData));
+
+    return fieldInfo;
+  }
+
+  const FieldType recursiveChildMetadata(intptr_t i,
+                                         const char **outName,
+                                         void (**outFreeFunc)(const char *))
+  {
+    if (hasSuperclassMirror()) {
+      auto superMirror = superclassMirror();
+      auto superclassFieldCount = superMirror.recursiveCount();
+
+      if (i < superclassFieldCount) {
+        return superMirror.recursiveChildMetadata(i, outName, outFreeFunc);
+      } else {
+        i -= superclassFieldCount;
+      }
     }
-    
-    return AnyReturn(result);
+
+    return childMetadata(i, outName, outFreeFunc);
+  }
+
+  AnyReturn subscript(intptr_t i, const char **outName,
+                      void (**outFreeFunc)(const char *)) {
+    auto fieldInfo = childMetadata(i, outName, outFreeFunc);
+
+    auto *bytes = *reinterpret_cast<char * const *>(value);
+    auto fieldOffset = childOffset(i);
+    auto *fieldData = reinterpret_cast<OpaqueValue *>(bytes + fieldOffset);
+
+    return copyFieldContents(fieldData, fieldInfo);
   }
 
 #if SWIFT_OBJC_INTEROP
@@ -607,6 +761,15 @@ struct ObjCClassImpl : ClassImpl {
     return 0;
   }
   
+  intptr_t childOffset(intptr_t i) {
+    swift::crash("Cannot get children of Objective-C objects.");
+  }
+
+  const FieldType childMetadata(intptr_t i, const char **outName,
+                                void (**outFreeFunc)(const char *)) {
+    swift::crash("Cannot get children of Objective-C objects.");
+  }
+
   AnyReturn subscript(intptr_t i, const char **outName,
                       void (**outFreeFunc)(const char *)) {
     swift::crash("Cannot get children of Objective-C objects.");
@@ -624,7 +787,16 @@ struct MetatypeImpl : ReflectionMirrorImpl {
   intptr_t count() {
     return 0;
   }
-  
+
+  intptr_t childOffset(intptr_t i) {
+    swift::crash("Metatypes have no children.");
+  }
+
+  const FieldType childMetadata(intptr_t i, const char **outName,
+                                void (**outFreeFunc)(const char *)) {
+    swift::crash("Metatypes have no children.");
+  }
+
   AnyReturn subscript(intptr_t i, const char **outName,
                     void (**outFreeFunc)(const char *)) {
     swift::crash("Metatypes have no children.");
@@ -642,6 +814,15 @@ struct OpaqueImpl : ReflectionMirrorImpl {
     return 0;
   }
   
+  intptr_t childOffset(intptr_t i) {
+    swift::crash("Opaque types have no children.");
+  }
+
+  const FieldType childMetadata(intptr_t i, const char **outName,
+                                void (**outFreeFunc)(const char *)) {
+    swift::crash("Opaque types have no children.");
+  }
+
   AnyReturn subscript(intptr_t i, const char **outName,
                     void (**outFreeFunc)(const char *)) {
     swift::crash("Opaque types have no children.");
@@ -728,7 +909,7 @@ auto call(OpaqueValue *passedValue, const Metadata *T, const Metadata *passedTyp
 
     case MetadataKind::Opaque: {
 #if SWIFT_OBJC_INTEROP
-      // If this is the Builtin.UnknownObject type, use the dynamic type of the
+      // If this is the AnyObject type, use the dynamic type of the
       // object reference.
       if (type == &METADATA_SYM(BO).base) {
         return callClass();
@@ -743,7 +924,7 @@ auto call(OpaqueValue *passedValue, const Metadata *T, const Metadata *passedTyp
           return callClass();
         }
       }
-      LLVM_FALLTHROUGH;
+      SWIFT_FALLTHROUGH;
     }
 
     /// TODO: Implement specialized mirror witnesses for all kinds.
@@ -774,6 +955,12 @@ const Metadata *swift_reflectionMirror_normalizedType(OpaqueValue *value,
   return call(value, T, type, [](ReflectionMirrorImpl *impl) { return impl->type; });
 }
 
+// func _getMetadataKind(_ type: Any.Type) -> UInt
+SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_API
+uintptr_t swift_getMetadataKind(const Metadata *type) {
+  return static_cast<uintptr_t>(type->getKind());
+}
+
 // func _getChildCount<T>(_: T, type: Any.Type) -> Int
 SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_API
 intptr_t swift_reflectionMirror_count(OpaqueValue *value,
@@ -781,6 +968,44 @@ intptr_t swift_reflectionMirror_count(OpaqueValue *value,
                                       const Metadata *T) {
   return call(value, T, type, [](ReflectionMirrorImpl *impl) {
     return impl->count();
+  });
+}
+
+// func _getChildCount(_ type: Any.Type) -> Int
+SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_API
+intptr_t swift_reflectionMirror_recursiveCount(const Metadata *type) {
+  return call(nullptr, type, type, [](ReflectionMirrorImpl *impl) {
+    return impl->recursiveCount();
+  });
+}
+
+// func _getChildMetadata(
+//   type: Any.Type,
+//   index: Int,
+//   outName: UnsafeMutablePointer<UnsafePointer<CChar>?>,
+//   outFreeFunc: UnsafeMutablePointer<NameFreeFunc?>
+// ) -> Any.Type
+SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_API
+const Metadata *swift_reflectionMirror_recursiveChildMetadata(
+                                       const Metadata *type,
+                                       intptr_t index,
+                                       const char **outName,
+                                       void (**outFreeFunc)(const char *)) {
+  return call(nullptr, type, type, [&](ReflectionMirrorImpl *impl) {
+    return impl->recursiveChildMetadata(index, outName, outFreeFunc).getType();
+  });
+}
+
+// internal func _getChildOffset(
+//   type: Any.Type,
+//   index: Int
+// ) -> Int
+SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_API
+intptr_t swift_reflectionMirror_recursiveChildOffset(
+                                       const Metadata *type,
+                                       intptr_t index) {
+  return call(nullptr, type, type, [&](ReflectionMirrorImpl *impl) {
+    return impl->recursiveChildOffset(index);
   });
 }
 

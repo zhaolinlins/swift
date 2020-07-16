@@ -20,6 +20,7 @@
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/DiagnosticsIRGen.h"
 
+#include "BitPatternBuilder.h"
 #include "FixedTypeInfo.h"
 #include "IRGenFunction.h"
 #include "IRGenModule.h"
@@ -69,6 +70,7 @@ StructLayout::StructLayout(IRGenModule &IGM,
     assert(!builder.empty() == requiresHeapHeader(layoutKind));
     MinimumAlign = Alignment(1);
     MinimumSize = Size(0);
+    headerSize = builder.getHeaderSize();
     SpareBits.clear();
     IsFixedLayout = true;
     IsKnownPOD = IsPOD;
@@ -78,6 +80,7 @@ StructLayout::StructLayout(IRGenModule &IGM,
   } else {
     MinimumAlign = builder.getAlignment();
     MinimumSize = builder.getSize();
+    headerSize = builder.getHeaderSize();
     SpareBits = builder.getSpareBits();
     IsFixedLayout = builder.isFixedLayout();
     IsKnownPOD = builder.isPOD();
@@ -155,6 +158,7 @@ Address ElementLayout::project(IRGenFunction &IGF, Address baseAddr,
                                const llvm::Twine &suffix) const {
   switch (getKind()) {
   case Kind::Empty:
+  case Kind::EmptyTailAllocatedCType:
     return getType().getUndefAddress();
 
   case Kind::Fixed:
@@ -184,6 +188,7 @@ void StructLayoutBuilder::addHeapHeader() {
   CurSize = IGM.RefCountedStructSize;
   CurAlignment = IGM.getPointerAlignment();
   StructFields.push_back(IGM.RefCountedStructTy);
+  headerSize = CurSize;
 }
 
 void StructLayoutBuilder::addNSObjectHeader() {
@@ -191,6 +196,7 @@ void StructLayoutBuilder::addNSObjectHeader() {
   CurSize = IGM.getPointerSize();
   CurAlignment = IGM.getPointerAlignment();
   StructFields.push_back(IGM.ObjCClassPtrTy);
+  headerSize = CurSize;
 }
 
 bool StructLayoutBuilder::addFields(llvm::MutableArrayRef<ElementLayout> elts,
@@ -217,7 +223,7 @@ bool StructLayoutBuilder::addField(ElementLayout &elt,
   if (eltTI.isKnownEmpty(ResilienceExpansion::Maximal)) {
     addEmptyElement(elt);
     // If the element type is empty, it adds nothing.
-    NextNonFixedOffsetIndex++;
+    ++NextNonFixedOffsetIndex;
     return false;
   }
   // TODO: consider using different layout rules.
@@ -232,7 +238,7 @@ bool StructLayoutBuilder::addField(ElementLayout &elt,
   } else {
     addNonFixedSizeElement(elt);
   }
-  NextNonFixedOffsetIndex++;
+  ++NextNonFixedOffsetIndex;
   return true;
 }
 
@@ -306,7 +312,8 @@ void StructLayoutBuilder::addNonFixedSizeElement(ElementLayout &elt) {
 
 /// Add an empty element to the aggregate.
 void StructLayoutBuilder::addEmptyElement(ElementLayout &elt) {
-  elt.completeEmpty(elt.getType().isPOD(ResilienceExpansion::Maximal));
+  auto byteOffset = isFixedLayout() ? CurSize : Size(0);
+  elt.completeEmpty(elt.getType().isPOD(ResilienceExpansion::Maximal), byteOffset);
 }
 
 /// Add an element at the fixed offset of the current end of the
@@ -363,24 +370,9 @@ void StructLayoutBuilder::setAsBodyOfStruct(llvm::StructType *type) const {
 
 /// Return the spare bit mask of the structure built so far.
 SpareBitVector StructLayoutBuilder::getSpareBits() const {
-  // Calculate the size up front to reduce possible allocations.
-  unsigned numBits = 0;
-  for (auto &v : CurSpareBits) {
-    numBits += v.size();
+  auto spareBits = BitPatternBuilder(IGM.Triple.isLittleEndian());
+  for (const auto &v : CurSpareBits) {
+    spareBits.append(v);
   }
-  if (numBits == 0) {
-    return SpareBitVector();
-  }
-  // Assemble the spare bit mask.
-  auto mask = llvm::APInt::getNullValue(numBits);
-  unsigned offset = 0;
-  for (auto &v : CurSpareBits) {
-    if (v.size() == 0) {
-      continue;
-    }
-    mask.insertBits(v.asAPInt(), offset);
-    offset += v.size();
-  }
-  assert(offset == numBits);
-  return SpareBitVector::fromAPInt(std::move(mask));
+  return spareBits.build();
 }

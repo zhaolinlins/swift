@@ -38,13 +38,11 @@
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/IR/Attributes.h"
-#include "llvm/IR/CallSite.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
-#include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/ValueHandle.h"
@@ -462,8 +460,8 @@ bool SwiftMergeFunctions::doSanityCheck(std::vector<WeakTrackingVH> &Worklist) {
         if (Res1 != -Res2) {
           dbgs() << "MERGEFUNC-SANITY: Non-symmetric; triple: " << TripleNumber
                  << "\n";
-          F1->dump();
-          F2->dump();
+          LLVM_DEBUG(F1->dump());
+          LLVM_DEBUG(F2->dump());
           Valid = false;
         }
 
@@ -500,9 +498,9 @@ bool SwiftMergeFunctions::doSanityCheck(std::vector<WeakTrackingVH> &Worklist) {
                    << TripleNumber << "\n";
             dbgs() << "Res1, Res3, Res4: " << Res1 << ", " << Res3 << ", "
                    << Res4 << "\n";
-            F1->dump();
-            F2->dump();
-            F3->dump();
+            LLVM_DEBUG(F1->dump());
+            LLVM_DEBUG(F2->dump());
+            LLVM_DEBUG(F3->dump());
             Valid = false;
           }
         }
@@ -544,8 +542,8 @@ static bool isEligibleFunction(Function *F) {
   // outweighs the benefit.
   for (BasicBlock &BB : *F) {
     for (Instruction &I : BB) {
-      if (CallSite CS = CallSite(&I)) {
-        Function *Callee = CS.getCalledFunction();
+      if (CallBase *CB = dyn_cast<CallBase>(&I)) {
+        Function *Callee = CB->getCalledFunction();
         if (Callee && !mayMergeCallsToFunction(*Callee))
           return false;
         if (!Callee || !Callee->isIntrinsic()) {
@@ -1080,7 +1078,7 @@ bool SwiftMergeFunctions::replaceDirectCallers(Function *Old, Function *New,
       removeEquivalenceClassFromTree(FE);
     
     auto *CI = dyn_cast<CallInst>(I);
-    if (!CI || CI->getCalledValue() != Old) {
+    if (!CI || CI->getCalledOperand() != Old) {
       AllReplaced = false;
       continue;
     }
@@ -1126,7 +1124,7 @@ bool SwiftMergeFunctions::replaceDirectCallers(Function *Old, Function *New,
                         cast<PointerType>(New->getType())->getAddressSpace());
 
     Value *Callee = ConstantExpr::getBitCast(New, FPtrType);
-    CallInst *NewCI = Builder.CreateCall(Callee, NewArgs);
+    CallInst *NewCI = Builder.CreateCall(FType, Callee, NewArgs);
     NewCI->setCallingConv(CI->getCallingConv());
     // Don't transfer attributes from the function to the callee. Function
     // attributes typically aren't relevant to the calling convention or ABI.

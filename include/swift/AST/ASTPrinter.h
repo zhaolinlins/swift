@@ -14,8 +14,10 @@
 #define SWIFT_AST_ASTPRINTER_H
 
 #include "swift/Basic/LLVM.h"
+#include "swift/Basic/QuotedString.h"
 #include "swift/Basic/UUID.h"
 #include "swift/AST/Identifier.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/raw_ostream.h"
@@ -29,7 +31,7 @@ namespace swift {
   class TypeDecl;
   class EnumElementDecl;
   class Type;
-  struct TypeLoc;
+  class TypeLoc;
   class Pattern;
   class ExtensionDecl;
   class NominalTypeDecl;
@@ -136,7 +138,11 @@ public:
   /// \param T the original \c Type being referenced. May be null.
   /// \param RefTo the \c TypeDecl this is considered a reference to.
   /// \param Name the name to be printed.
-  virtual void printTypeRef(Type T, const TypeDecl *RefTo, Identifier Name);
+  /// \param NameContext the \c PrintNameContext which this type is being
+  ///                    printed in, used to determine how to escape type names.
+  virtual void printTypeRef(
+      Type T, const TypeDecl *RefTo, Identifier Name,
+      PrintNameContext NameContext = PrintNameContext::Normal);
 
   /// Called when printing the referenced name of a module.
   virtual void printModuleRef(ModuleEntity Mod, Identifier Name);
@@ -181,10 +187,15 @@ public:
     return *this;
   }
 
+  ASTPrinter &operator<<(QuotedString s);
+
   ASTPrinter &operator<<(unsigned long long N);
   ASTPrinter &operator<<(UUID UU);
 
+  ASTPrinter &operator<<(Identifier name);
+  ASTPrinter &operator<<(DeclBaseName name);
   ASTPrinter &operator<<(DeclName name);
+  ASTPrinter &operator<<(DeclNameRef name);
 
   // Special case for 'char', but not arbitrary things that convert to 'char'.
   template <typename T>
@@ -193,9 +204,12 @@ public:
     return *this << StringRef(&c, 1);
   }
 
-  void printKeyword(StringRef name, PrintOptions Opts, StringRef Suffix = "") {
+  void printKeyword(StringRef name,
+                    const PrintOptions &Opts,
+                    StringRef Suffix = "") {
     if (Opts.SkipUnderscoredKeywords && name.startswith("_"))
       return;
+    assert(!name.empty() && "Tried to print empty keyword");
     callPrintNamePre(PrintNameContext::Keyword);
     *this << name;
     printNamePost(PrintNameContext::Keyword);

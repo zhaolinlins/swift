@@ -17,7 +17,6 @@
 #include "swift/Basic/SourceLoc.h"
 #include "clang/Basic/FileManager.h"
 #include "llvm/ADT/Optional.h"
-#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/SourceMgr.h"
 #include <map>
 
@@ -48,6 +47,7 @@ class SourceManager {
   std::map<const char *, VirtualFile> VirtualFiles;
   mutable std::pair<const char *, const VirtualFile*> CachedVFile = {nullptr, nullptr};
 
+  Optional<unsigned> findBufferContainingLocInternal(SourceLoc Loc) const;
 public:
   SourceManager(llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FS =
                     llvm::vfs::getRealFileSystem())
@@ -73,6 +73,10 @@ public:
 
     CodeCompletionBufferID = BufferID;
     CodeCompletionOffset = Offset;
+  }
+
+  bool hasCodeCompletionBuffer() const {
+    return CodeCompletionBufferID != 0U;
   }
 
   unsigned getCodeCompletionBufferID() const {
@@ -115,6 +119,9 @@ public:
   /// Because a valid source location always corresponds to a source buffer,
   /// this routine always returns a valid buffer ID.
   unsigned findBufferContainingLoc(SourceLoc Loc) const;
+
+  /// Whether the source location is pointing to any buffer owned by the SourceManager.
+  bool isOwning(SourceLoc Loc) const;
 
   /// Adds a memory buffer to the SourceManager, taking ownership of it.
   unsigned addNewSourceBuffer(std::unique_ptr<llvm::MemoryBuffer> Buffer);
@@ -198,7 +205,7 @@ public:
   ///
   /// This respects \c #sourceLocation directives.
   std::pair<unsigned, unsigned>
-  getLineAndColumn(SourceLoc Loc, unsigned BufferID = 0) const {
+  getPresumedLineAndColumnForLoc(SourceLoc Loc, unsigned BufferID = 0) const {
     assert(Loc.isValid());
     int LineOffset = getLineOffset(Loc);
     int l, c;
@@ -207,14 +214,15 @@ public:
     return { LineOffset + l, c };
   }
 
-  /// Returns the real line number for a source location.
+  /// Returns the real line and column for a source location.
   ///
   /// If \p BufferID is provided, \p Loc must come from that source buffer.
   ///
   /// This does not respect \c #sourceLocation directives.
-  unsigned getLineNumber(SourceLoc Loc, unsigned BufferID = 0) const {
+  std::pair<unsigned, unsigned>
+  getLineAndColumnInBuffer(SourceLoc Loc, unsigned BufferID = 0) const {
     assert(Loc.isValid());
-    return LLVMSourceMgr.FindLineNumber(Loc.Value, BufferID);
+    return LLVMSourceMgr.getLineAndColumn(Loc.Value, BufferID);
   }
 
   StringRef getEntireTextForBuffer(unsigned BufferID) const;
@@ -239,20 +247,31 @@ public:
   llvm::Optional<unsigned> resolveOffsetForEndOfLine(unsigned BufferId,
                                                      unsigned Line) const;
 
+  /// Get the length of the line
+  llvm::Optional<unsigned> getLineLength(unsigned BufferId, unsigned Line) const;
+
   SourceLoc getLocForLineCol(unsigned BufferId, unsigned Line, unsigned Col) const {
     auto Offset = resolveFromLineCol(BufferId, Line, Col);
     return Offset.hasValue() ? getLocForOffset(BufferId, Offset.getValue()) :
                                SourceLoc();
   }
 
+  std::string getLineString(unsigned BufferID, unsigned LineNumber);
+
+  SourceLoc getLocFromExternalSource(StringRef Path, unsigned Line, unsigned Col);
 private:
   const VirtualFile *getVirtualFile(SourceLoc Loc) const;
-
+  unsigned getExternalSourceBufferId(StringRef Path);
   int getLineOffset(SourceLoc Loc) const {
     if (auto VFile = getVirtualFile(Loc))
       return VFile->LineOffset;
     else
       return 0;
+  }
+
+public:
+  bool isLocInVirtualFile(SourceLoc Loc) const {
+    return getVirtualFile(Loc) != nullptr;
   }
 };
 
